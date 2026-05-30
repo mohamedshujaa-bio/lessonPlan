@@ -1,0 +1,3071 @@
+import React, { useState, useEffect } from 'react';
+import { 
+  FileText, Upload, Sparkles, Download, Printer, RefreshCw, 
+  BookOpen, Calendar, Clock, Layers, CheckSquare, Award, 
+  Check, AlertCircle, Eye, Plus, Trash2, Globe
+} from 'lucide-react';
+
+// --- Global Configs and Helpers ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'lesson-plan-generator-v1';
+const apiKey = "AIzaSyCE0NNT8yhad500EePKFO6vS81H5qY28Vc"; // Provided active key
+
+// Robust exponential backoff API caller for Gemini with Multi-Lesson Targeted Parsing & Search Grounding
+async function callGeminiAPI(parsedText, targetWeek = "", extraUrlContext = "") {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=" + apiKey;
+  
+  const systemPrompt = `You are an expert curriculum design assistant. Analyze the provided text content extracted from a document and map it into an array of structured JSON lesson plans for WEEK: "${targetWeek}".
+
+CRITICAL DRIVE LINK & INTERNET SEARCH Grounding:
+1. Scan the text for any Google Drive links or resource URLs mentioned.
+2. If any URL or context like "${extraUrlContext}" is provided, use Google Search Grounding to integrate detailed, scientifically accurate descriptions, diagrams, and experiments.
+3. Integrate these findings heavily into the 'activityTable' (learningActivity) for each lesson.
+
+CRITICAL TIMING & STRUCTURE:
+- Each lesson's duration must be set strictly to "35 minutes".
+- Divide the weekly material logically into a progressive sequence of exactly 4 chronological lessons.
+- Ensure keyCompetencies and sharedValues mapping uses strict boolean variables.`;
+
+  const schema = {
+    type: "OBJECT",
+    properties: {
+      lessons: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            week: { type: "STRING" },
+            date: { type: "STRING" },
+            time: { type: "STRING" },
+            lessonNumber: { type: "STRING" },
+            class: { type: "STRING" },
+            subject: { type: "STRING" },
+            strand: { type: "STRING" },
+            theme: { type: "STRING" },
+            subStrand: { type: "STRING" },
+            indicators: { type: "STRING" },
+            processSkills: { type: "STRING" },
+            knowledgeSkills: { type: "STRING" },
+            keyCompetencies: {
+              type: "OBJECT",
+              properties: {
+                practicingIslam: { type: "BOOLEAN" },
+                managingSelf: { type: "BOOLEAN" },
+                criticalThinking: { type: "BOOLEAN" },
+                meaningMaking: { type: "BOOLEAN" },
+                healthyLife: { type: "BOOLEAN" },
+                sustainableDevelopment: { type: "BOOLEAN" },
+                techMedia: { type: "BOOLEAN" },
+                relatingPeople: { type: "BOOLEAN" }
+              }
+            },
+            progressionOfCompetencies: { type: "STRING" },
+            bulletOutcomes: { type: "ARRAY", items: { type: "STRING" } },
+            sharedValues: {
+              type: "OBJECT",
+              properties: {
+                self: { type: "BOOLEAN" },
+                community: { type: "BOOLEAN" },
+                family: { type: "BOOLEAN" },
+                environment: { type: "BOOLEAN" }
+              }
+            },
+            activitiesSummary: { type: "STRING" },
+            teachingAids: { type: "STRING" },
+            resources: { type: "STRING" },
+            priorKnowledge: { type: "STRING" },
+            learningIntention: { type: "STRING" },
+            successCriteria: { type: "STRING" },
+            activityTable: {
+              type: "ARRAY",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  stepName: { type: "STRING" },
+                  successCriteria: { type: "STRING" },
+                  learningActivity: { type: "STRING" },
+                  time: { type: "STRING" },
+                  assessment: { type: "STRING" }
+                }
+              }
+            },
+            reflection: { type: "STRING" },
+            preparedBy: {
+              type: "OBJECT",
+              properties: {
+                name: { type: "STRING" },
+                position: { type: "STRING" },
+                signature: { type: "STRING" }
+              }
+            },
+            checkedBy: {
+              type: "OBJECT",
+              properties: {
+                name: { type: "STRING" },
+                position: { type: "STRING" },
+                signature: { type: "STRING" }
+              }
+            }
+          },
+          required: ["subject", "class", "keyCompetencies", "activityTable"]
+        }
+      }
+    },
+    required: ["lessons"]
+  };
+
+  const payload = {
+    contents: [{ parts: [{ text: "Extract multi-lesson plan steps for Week: \"" + targetWeek + "\". Extra URL context: " + extraUrlContext + ". Text:\n\n" + parsedText }] }],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    tools: [{ "google_search": {} }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: schema }
+  };
+
+  let delay = 1000;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (response.ok) {
+        const json = await response.json();
+        const responseText = json.candidates?.[0]?.content?.parts?.[0]?.text;
+        return JSON.parse(responseText);
+      }
+    } catch (err) {
+      // Retry
+    }
+    await new Promise(resolve => setTimeout(resolve, delay));
+    delay *= 2;
+  }
+  throw new Error("Syllabus parse failed. Please check the text format.");
+}
+
+// AI Class Worksheet generator API caller supporting Worksheet Types and Student levels (Normal, ICP, lower level)
+async function callGeminiWorksheetAPI(lessonContext, driveLink, numQ, timeLimit, abilityLevel, worksheetType, selectedGrade) {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=" + apiKey;
+  
+  const systemPrompt = `You are an expert assessment designer. Generate a structured classroom worksheet based on the provided lesson context and resource details.
+
+STUDENT LEVEL RULES:
+- Normal: Standard academic, grade-appropriate questions, conceptual matches, and analytical checks.
+- ICP (Individualized Education Program): Highly supportive prompts, step-by-step visual hints, simplified phrasing, and structured guides.
+- lower level: Focus on simple recall, basic definitions, and highly descriptive diagrams. Simple structures, fill-in-the-blanks, or multiple choice.
+
+WORKSHEET TYPE SPECIFIC RULES:
+- "MCQ": Provide exactly 4 options (A, B, C, D) inside the questionText.
+- "Quiz": Short-answer question blocks testing quick retrieval.
+- "Question and Answer": Direct open-ended conceptual/analytical questions.
+- "Fill in the blanks": Sentences with empty blanks (e.g. "The digestive organ ________ absorbs nutrients").
+- "Match the columns": Pairs of matching items.
+
+Generate EXACTLY questions with points, space instructions, and a precise matching expected answer key.`;
+
+  const schema = {
+    type: "OBJECT",
+    properties: {
+      title: { type: "STRING" },
+      instructions: { type: "STRING" },
+      questions: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            qNo: { type: "STRING" },
+            questionText: { type: "STRING" },
+            points: { type: "STRING" },
+            answerSpaceInstructions: { type: "STRING" },
+            expectedAnswer: { type: "STRING" }
+          }
+        }
+      }
+    },
+    required: ["title", "instructions", "questions"]
+  };
+
+  const payload = {
+    contents: [
+      { 
+        parts: [
+          { 
+            text: "Generate a high-fidelity class worksheet of type: \"" + worksheetType + "\". Topic Context: " + JSON.stringify(lessonContext) + " Google Drive Context URL: " + driveLink + " Number of Questions: " + numQ + " Allocated Time: " + timeLimit + " Target Student level: " + abilityLevel + " Target Student Grade: " + selectedGrade
+          }
+        ] 
+      }
+    ],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    tools: [{ "google_search": {} }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: schema }
+  };
+
+  let delay = 1000;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (response.ok) {
+        const json = await response.json();
+        const responseText = json.candidates?.[0]?.content?.parts?.[0]?.text;
+        return JSON.parse(responseText);
+      }
+    } catch (err) {
+      // Retry
+    }
+    await new Promise(resolve => setTimeout(resolve, delay));
+    delay *= 2;
+  }
+  throw new Error("Worksheet generation failed.");
+}
+
+// ✨ Gemini LLM Assistant to Generate Outcomes and Aligned Indicators based on active topic
+async function callGeminiOutcomesAPI(subject, strand, subStrand) {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=" + apiKey;
+  const systemPrompt = `You are a curriculum alignment expert. Based on the subject, theme/strand, and subtopic, write aligned outcomes, indicators, prior knowledge requirements, learning intentions, process skills, and success criteria. Keep everything highly focused and concise, in clean JSON format.`;
+  const schema = {
+    type: "OBJECT",
+    properties: {
+      indicators: { type: "STRING" },
+      processSkills: { type: "STRING" },
+      knowledgeSkills: { type: "STRING" },
+      bulletOutcomes: { type: "ARRAY", items: { type: "STRING" } },
+      priorKnowledge: { type: "STRING" },
+      learningIntention: { type: "STRING" },
+      successCriteria: { type: "STRING" }
+    },
+    required: ["indicators", "bulletOutcomes", "learningIntention", "successCriteria"]
+  };
+  const payload = {
+    contents: [
+      { parts: [{ text: "Generate aligned outcomes and indicators for: Subject: " + subject + ", Strand: " + strand + ", Sub-Str-and: " + subStrand }] }
+    ],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    generationConfig: { responseMimeType: "application/json", responseSchema: schema }
+  };
+  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  if (response.ok) {
+    const json = await response.json();
+    return JSON.parse(json.candidates?.[0]?.content?.parts?.[0]?.text);
+  }
+  throw new Error("Outcomes alignment API failed.");
+}
+
+// ✨ Gemini LLM Assistant to Enhance and Differentiate Lesson Activities based on selection styles, competencies, and Maldivian context
+async function callGeminiEnhanceActivitiesAPI(subject, strand, subStrand, activityStyle, studentLevel, currentActivities, keyCompetencies, sharedValues, classGrade) {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=" + apiKey;
+  
+  const systemPrompt = `You are an expert curriculum developer specializing in Maldivian pedagogical alignment and Islamic value integration.
+Take the lesson outline, the selected pedagogy style, and the student level, and generate extremely descriptive step-by-step interactive classroom activities.
+
+CRITICAL COMPETENCIES & VALUES GROUNDING:
+Here are the selected parameters from the Maldives National Curriculum:
+- Active Key Competencies Checked: \${JSON.stringify(keyCompetencies)}
+- Active Shared Values Checked: \${JSON.stringify(sharedValues)}
+- Target Student Grade: \${classGrade}
+
+You MUST explicitly integrate these checked values and competencies into the lesson activities:
+1. If "practicingIslam" is checked, include active reflections or Islamic stewardship connections regarding the wonders of creation, science, or community health.
+2. If "relatingPeople" or "community" is checked, structure group-cooperative learning steps modeled after traditional Maldivian community mutual aid ("Ekuverikan" / cooperative island spirit).
+3. Ground the explanations in Maldives local island ecosystems, geography, coral reefs, or regional atoll resources where applicable to the subject matter.
+
+CRITICAL SCIENCE & WHITEBOARD DIAGRAM REQUIREMENT:
+At least one step (preferable Activity 1 or the main explanation step) MUST contain an explicit, clean whiteboard explanatory diagram.
+Provide this diagram directly inside the text using either:
+- A beautiful, clear, and structured text-based ASCII flowchart/architecture map.
+- Or a mini inline-styled SVG block explaining the biological, mechanical, or conceptual process (e.g. digestive path, cellular parts, or flow maps) with clear labels.
+
+Structure the timing of all generated activities to total EXACTLY 35 minutes (Starter, Activity 1, etc.).`;
+
+  const schema = {
+    type: "OBJECT",
+    properties: {
+      enhancedActivities: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            stepName: { type: "STRING" },
+            successCriteria: { type: "STRING" },
+            learningActivity: { type: "STRING" }, // Put ASCII/SVG diagram here inside steps
+            time: { type: "STRING" },
+            assessment: { type: "STRING" }
+          }
+        }
+      },
+      teachingAids: { type: "STRING" },
+      activitiesSummary: { type: "STRING" },
+      reflection: { type: "STRING" }
+    },
+    required: ["enhancedActivities", "teachingAids", "activitiesSummary", "reflection"]
+  };
+
+  const payload = {
+    contents: [
+      { parts: [{ text: "Expand these activity steps for Subject: " + subject + ", Sub-Strand: " + subStrand + ". Style: " + activityStyle + ", Student Level: " + studentLevel + ". Current Outline: " + JSON.stringify(currentActivities) }] }
+    ],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    tools: [{ "google_search": {} }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: schema }
+  };
+
+  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  if (response.ok) {
+    const json = await response.json();
+    return JSON.parse(json.candidates?.[0]?.content?.parts?.[0]?.text);
+  }
+  throw new Error("Enhance Activities API failed.");
+}
+
+// ✨ Gemini LLM Assistant to Generate Maldives Local Context & Islamic Integration Hook
+async function callGeminiLocalHookAPI(subject, strand, subStrand) {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=" + apiKey;
+  const systemPrompt = `You are an expert curriculum consultant specializing in Islamic Value Integration and localized Maldives contextual learning. Write a solid paragraph combining how this lesson topic links to Maldivian nature, local geography/islands, and Islamic teachings on stewardship or knowledge. Keep it concise.`;
+  
+  const payload = {
+    contents: [
+      { parts: [{ text: "Create an Islamic and Maldives local integration hook for: Subject: " + subject + ", Theme: " + strand + ", Sub-Strand: " + subStrand }] }
+    ],
+    systemInstruction: { parts: [{ text: systemPrompt }] }
+  };
+  
+  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  if (response.ok) {
+    const json = await response.json();
+    return json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  }
+  throw new Error("Maldives Hook integration API failed.");
+}
+
+// ✨ Gemini LLM Assistant to Generate Detailed Reflection Notes
+async function callGeminiReflectionAPI(subject, subStrand, activitiesSummary) {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=" + apiKey;
+  const systemPrompt = `You are a pedagogical mentor. Write a highly realistic, professional post-lesson teacher reflection evaluating student engagement, grasp of concepts, and actionable future adjustments. Evaluate this topic specifically.`;
+  
+  const payload = {
+    contents: [
+      { parts: [{ text: "Generate detailed reflection notes for a 35-minute class about: Subject: " + subject + ", Topic: " + subStrand + ". Activities Summary: " + activitiesSummary }] }
+    ],
+    systemInstruction: { parts: [{ text: systemPrompt }] }
+  };
+  
+  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  if (response.ok) {
+    const json = await response.json();
+    return json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  }
+  throw new Error("Reflection writer API failed.");
+}
+
+// Initial Sample Lessons (Multi-Lesson Structure: Lessons 1 to 4 strictly set to "35 minutes" by default)
+const sampleLessons = [
+  {
+    week: "35",
+    date: "18/5/26",
+    time: "35 minutes",
+    lessonNumber: "1",
+    class: "Grade 9",
+    subject: "Biology",
+    strand: "Structure and Function of Organisms",
+    theme: "Human Biology Systems",
+    subStrand: "Digestive System - Lesson 1 (Mechanical)",
+    indicators: "9.1.1 Describe physical (mechanical) digestion in the human body.",
+    processSkills: "Explore anatomical jaw molds and label tooth structures.",
+    knowledgeSkills: "Recall the digestive tract organs from earlier grades.",
+    keyCompetencies: {
+      practicingIslam: false,
+      managingSelf: true,
+      criticalThinking: true,
+      meaningMaking: false,
+      healthyLife: true,
+      sustainableDevelopment: false,
+      techMedia: false,
+      relatingPeople: true
+    },
+    progressionOfCompetencies: "Fostering team observation and accurate descriptive naming systems.",
+    bulletOutcomes: [
+      "Describe the role of teeth in mechanical food breakdown.",
+      "Identify the 4 types of teeth inside human jaws."
+    ],
+    sharedValues: {
+      self: true,
+      community: false,
+      family: false,
+      environment: false
+    },
+    activitiesSummary: "Mouth-feel counts, drawing canine/incisor/molar outlines on worksheets.",
+    teachingAids: "Anatomical mouth jaw mold, labeled teeth layout posters.",
+    resources: "Biology worksheets, dental mirror model set. Drive link: https://drive.google.com/file/d/digestive-mechanics-test-sheet",
+    priorKnowledge: "Basic stomach concepts from Science Grade 8.",
+    learningIntention: "Understand tooth functions as primary mechanical digesters.",
+    successCriteria: "Label 4 teeth types and define mechanical digestion.",
+    activityTable: [
+      {
+        stepName: "Starter",
+        successCriteria: "Recall jaw count",
+        learningActivity: "Show the jaw model. Instruct students to run tongue along their teeth and locate different sharp/flat shapes.",
+        time: "10 mins",
+        assessment: "In-class oral recap."
+      },
+      {
+        stepName: "Activity 1",
+        successCriteria: "Sketch teeth",
+        learningActivity: "Students draw canine, incisor, premolar, and molar diagrams and label them.",
+        time: "25 mins",
+        assessment: "Peer review of drawings."
+      }
+    ],
+    reflection: "Great engagement with the jaw molds. Students loved the visual counting activity.",
+    preparedBy: { name: "Hussain Sifaz", position: "Senior Biology Teacher", signature: "H. Sifaz" },
+    checkedBy: { name: "Aishath Zuhura", position: "HOD Science Department", signature: "A. Zuhura" },
+    worksheet: {
+      title: "Mechanical Digestion & Dental Structure Review",
+      instructions: "Read each question carefully and write your answers in the spaces provided.",
+      time: "15 mins",
+      level: "Normal",
+      grade: "Grade 9",
+      type: "Question and Answer",
+      questions: [
+        {
+          qNo: "1",
+          questionText: "Identify the four distinct types of teeth present in the human mouth and describe the specific function of each type during mechanical mastication.",
+          points: "4 Marks",
+          answerSpaceInstructions: "Write your answer in 4-5 lines below.",
+          expectedAnswer: "1. Incisors (cutting food), 2. Canines (tearing food), 3. Premolars (crushing/grinding), 4. Molars (extensive grinding)."
+        },
+        {
+          qNo: "2",
+          questionText: "Explain how physical/mechanical digestion enhances the efficiency of chemical enzymes downstream in the stomach and small intestine.",
+          points: "3 Marks",
+          answerSpaceInstructions: "Write your answer in 3 lines below.",
+          expectedAnswer: "Mechanical digestion breaks food into smaller particles, drastically increasing the total surface area available for liquid digestive enzymes to act upon."
+        }
+      ]
+    }
+  },
+  {
+    week: "35",
+    date: "19/5/26",
+    time: "35 minutes",
+    lessonNumber: "2",
+    class: "Grade 9",
+    subject: "Biology",
+    strand: "Structure and Function of Organisms",
+    theme: "Human Biology Systems",
+    subStrand: "Digestive System - Lesson 2 (Chemical)",
+    indicators: "9.1.2 Investigate chemical digestion and enzyme activities.",
+    processSkills: "Measure and chart fluid enzymatic breakdown effects.",
+    knowledgeSkills: "Analyze role of saliva as a chemical digester compared to stomach acid.",
+    keyCompetencies: {
+      practicingIslam: false,
+      managingSelf: false,
+      criticalThinking: true,
+      meaningMaking: true,
+      healthyLife: false,
+      sustainableDevelopment: false,
+      techMedia: true,
+      relatingPeople: false
+    },
+    progressionOfCompetencies: "Forming rational evidence-based scientific conclusions.",
+    bulletOutcomes: [
+      "Contrast mechanical digestion with chemical digestion.",
+      "Identify the primary chemical enzymes produced in saliva."
+    ],
+    sharedValues: {
+      self: false,
+      community: true,
+      family: false,
+      environment: false
+    },
+    activitiesSummary: "Conduct starch breakdown tube experiment using amylase.",
+    teachingAids: "Enzyme amylase liquids, test tubes, iodine indicator bottles.",
+    resources: "Lab safety goggles, beaker, starch solutions.",
+    priorKnowledge: "Tooth mechanical functions established during Lesson 1.",
+    learningIntention: "Explain salivary amylase digestion of starches.",
+    successCriteria: "State output of starch enzyme breakdown.",
+    activityTable: [
+      {
+        stepName: "Starter",
+        successCriteria: "Link mechanical digestion",
+        learningActivity: "Ask how chewed up food converts to energy. Explain chemical actions using liquid tests.",
+        time: "10 mins",
+        assessment: "Cold-call questioning."
+      },
+      {
+        stepName: "Activity 1",
+        successCriteria: "Run enzyme test",
+        learningActivity: "Students observe amylase mixed with starch solution turning clear in iodine checks, demonstrating decomposition.",
+        time: "25 mins",
+        assessment: "Lab worksheet review."
+      }
+    ],
+    reflection: "Enzyme color changes worked cleanly. Good link established with Lesson 1 mechanical lessons.",
+    preparedBy: { name: "Hussain Sifaz", position: "Senior Biology Teacher", signature: "H. Sifaz" },
+    checkedBy: { name: "Aishath Zuhura", position: "HOD Science Department", signature: "A. Zuhura" }
+  },
+  {
+    week: "35",
+    date: "20/5/26",
+    time: "35 minutes",
+    lessonNumber: "3",
+    class: "Grade 9",
+    subject: "Biology",
+    strand: "Structure and Function of Organisms",
+    theme: "Human Biology Systems",
+    subStrand: "Digestive System - Lesson 3 (Alimentary Canal)",
+    indicators: "9.1.3 Label the organs of the alimentary canal and describe stomach function.",
+    processSkills: "Trace the pathway of a food bolus using digestive system charts.",
+    knowledgeSkills: "Identify organs of the alimentary canal from mouth to anus.",
+    keyCompetencies: {
+      practicingIslam: false,
+      managingSelf: false,
+      criticalThinking: true,
+      meaningMaking: true,
+      healthyLife: false,
+      sustainableDevelopment: false,
+      techMedia: false,
+      relatingPeople: true
+    },
+    progressionOfCompetencies: "Collaborative structural tracing and logical systems mapping.",
+    bulletOutcomes: [
+      "Draw and label the main organs of the digestive tract.",
+      "Explain the role of gastric juices and stomach peristalsis."
+    ],
+    sharedValues: {
+      self: true,
+      community: false,
+      family: false,
+      environment: false
+    },
+    activitiesSummary: "Tracing the path of digested elements on full-size body maps in groups.",
+    teachingAids: "Digestive system roll-up chart, human torso replica model.",
+    resources: "Body outline worksheets, marker pens, sticky labels.",
+    priorKnowledge: "Salivary enzymes function from Lesson 2.",
+    learningIntention: "Map the path of food down the esophagus to the stomach.",
+    successCriteria: "Label esophagus, stomach, liver, and pancreas.",
+    activityTable: [
+      {
+        stepName: "Starter",
+        successCriteria: "Recall starch breakdown",
+        learningActivity: "Quick recap quiz on saliva amylase and mechanical breakdown actions.",
+        time: "10 mins",
+        assessment: "Thumbing up check"
+      },
+      {
+        stepName: "Activity 1",
+        successCriteria: "Trace pathway",
+        learningActivity: "Groups place organ sticky labels on full-scale anatomical poster sheets.",
+        time: "25 mins",
+        assessment: "Worksheet inspection"
+      }
+    ],
+    reflection: "Excellent spatial awareness shown. Direct links from esophagus to stomach were grasped easily.",
+    preparedBy: { name: "Hussain Sifaz", position: "Senior Biology Teacher", signature: "H. Sifaz" },
+    checkedBy: { name: "Aishath Zuhura", position: "HOD Science Department", signature: "A. Zuhura" }
+  },
+  {
+    week: "35",
+    date: "21/5/26",
+    time: "35 minutes",
+    lessonNumber: "4",
+    class: "Grade 9",
+    subject: "Biology",
+    strand: "Structure and Function of Organisms",
+    theme: "Human Biology Systems",
+    subStrand: "Digestive System - Lesson 4 (Absorption)",
+    indicators: "9.1.4 Explain how products of digestion are absorbed into the body.",
+    processSkills: "Analyze diagrams of microvilli structure and transport mechanics.",
+    knowledgeSkills: "Explain physical adaptations of small intestine walls for absorption.",
+    keyCompetencies: {
+      practicingIslam: false,
+      managingSelf: true,
+      criticalThinking: true,
+      meaningMaking: true,
+      healthyLife: true,
+      sustainableDevelopment: false,
+      techMedia: false,
+      relatingPeople: false
+    },
+    progressionOfCompetencies: "Linking macro organ functions to micro cellular structures.",
+    bulletOutcomes: [
+      "Describe how villi increase the surface area of the small intestines.",
+      "Differentiate between absorption and egestion."
+    ],
+    sharedValues: {
+      self: true,
+      community: false,
+      family: false,
+      environment: false
+    },
+    activitiesSummary: "Microscopic slide visualization of small intestine cross-sections and clay model builds.",
+    teachingAids: "Prepared villi slides, microscopes, clay modeling packets.",
+    resources: "Clay modeling guide, microscopic observation templates.",
+    priorKnowledge: "Pathway of bolus from Lesson 3.",
+    learningIntention: "Explain how digested food enters blood capillaries.",
+    successCriteria: "Explain why thin villi cell membranes speed up absorption.",
+    activityTable: [
+      {
+        stepName: "Starter",
+        successCriteria: "Organ path recap",
+        learningActivity: "Trace the food's arrival into the small intestine from the stomach.",
+        time: "10 mins",
+        assessment: "Oral review"
+      },
+      {
+        stepName: "Activity 1",
+        successCriteria: "Build villi model",
+        learningActivity: "Students construct three-dimensional clay models of villi to visualize capillary absorption loops.",
+        time: "25 mins",
+        assessment: "Clay design checks"
+      }
+    ],
+    reflection: "Clay models helped concrete the concept of surface area. Perfect end of week summary.",
+    preparedBy: { name: "Hussain Sifaz", position: "Senior Biology Teacher", signature: "H. Sifaz" },
+    checkedBy: { name: "Aishath Zuhura", position: "HOD Science Department", signature: "A. Zuhura" }
+  }
+];
+
+export default function App() {
+  const [lessons, setLessons] = useState(sampleLessons);
+  const [activeLessonIndex, setActiveLessonIndex] = useState(0);
+
+  const [loading, setLoading] = useState(false);
+  const [worksheetLoading, setWorksheetLoading] = useState(false);
+  const [outcomesLoading, setOutcomesLoading] = useState(false);
+  const [activitiesLoading, setActivitiesLoading] = useState(false);
+  const [localHookLoading, setLocalHookLoading] = useState(false);
+  const [reflectionLoading, setReflectionLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [successMsg, setSuccessMsg] = useState("");
+  const [activeTab, setActiveTab] = useState('meta'); 
+  const [libsLoaded, setLibsLoaded] = useState({ mammoth: false, xlsx: false, pdfjs: false, htmlDocx: false });
+
+  // Uploaded file cache states & External drive links inputs
+  const [uploadedText, setUploadedText] = useState("");
+  const [uploadedFileName, setUploadedFileName] = useState("");
+  const [weekInput, setWeekInput] = useState("35");
+  const [externalDriveLink, setExternalDriveLink] = useState("");
+
+  // Worksheet parameters states (Including selected Grade parameter)
+  const [wsNumQuestions, setWsNumQuestions] = useState("5");
+  const [wsTimeLimit, setWsTimeLimit] = useState("15 mins");
+  const [wsStudentLevel, setWsStudentLevel] = useState("Normal");
+  const [wsType, setWsType] = useState("Question and Answer");
+  const [wsGrade, setWsGrade] = useState("Grade 9"); // Selectable Grade state for worksheets
+  const [wsDriveLink, setWsDriveLink] = useState(""); // Directly near the generation button
+
+  // AI Activity expansion options with custom Maldives-aligned educational methods
+  const [pedagogyStyle, setPedagogyStyle] = useState("Montessori methods, inquiry-based learning, and hands-on experiments");
+  const [activitiesLevel, setActivitiesLevel] = useState("Normal");
+
+  // State to toggle Worksheet Generator Dialog
+  const [isWorksheetModalOpen, setIsWorksheetModalOpen] = useState(false);
+
+  // Dynamically inject parsing and word compiling libraries on component mount
+  useEffect(() => {
+    const loadScript = (src, globalName, key) => {
+      if (window[globalName]) {
+        setLibsLoaded(prev => ({ ...prev, [key]: true }));
+        return;
+      }
+      const script = document.createElement('script');
+      script.src = src;
+      script.async = true;
+      script.onload = () => {
+        setLibsLoaded(prev => ({ ...prev, [key]: true }));
+      };
+      document.head.appendChild(script);
+    };
+
+    loadScript("https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js", "mammoth", "mammoth");
+    loadScript("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js", "XLSX", "xlsx");
+    loadScript("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js", "pdfjsLib", "pdfjs");
+    loadScript("https://cdn.jsdelivr.net/npm/html-docx-js-typescript@0.1.6/dist/html-docx.js", "htmlDocx", "htmlDocx");
+  }, []);
+
+  // Sync general external Drive link to the local worksheet link if empty
+  useEffect(() => {
+    if (externalDriveLink && !wsDriveLink) {
+      setWsDriveLink(externalDriveLink);
+    }
+  }, [externalDriveLink]);
+
+  // Update specific fields safely for the active lesson
+  const updateField = (field, value) => {
+    const updated = [...lessons];
+    updated[activeLessonIndex][field] = value;
+    setLessons(updated);
+  };
+
+  const updateNestedField = (parent, field, value) => {
+    const updated = [...lessons];
+    updated[activeLessonIndex][parent] = {
+      ...updated[activeLessonIndex][parent],
+      [field]: value
+    };
+    setLessons(updated);
+  };
+
+  const updateActivityRow = (actIndex, field, value) => {
+    const updated = [...lessons];
+    const updatedActivities = [...updated[activeLessonIndex].activityTable];
+    updatedActivities[actIndex][field] = value;
+    updated[activeLessonIndex].activityTable = updatedActivities;
+    setLessons(updated);
+  };
+
+  const addActivityRow = () => {
+    const updated = [...lessons];
+    updated[activeLessonIndex].activityTable = [
+      ...updated[activeLessonIndex].activityTable,
+      { stepName: "Activity " + updated[activeLessonIndex].activityTable.length, successCriteria: "", learningActivity: "", time: "", assessment: "" }
+    ];
+    setLessons(updated);
+  };
+
+  const removeActivityRow = (actIndex) => {
+    const updated = [...lessons];
+    updated[activeLessonIndex].activityTable = updated[activeLessonIndex].activityTable.filter((_, i) => i !== actIndex);
+    setLessons(updated);
+  };
+
+  // Add a brand new empty lesson plan (strictly locked to "35 minutes" default, allows up to 12 lessons)
+  const addNewPeriod = () => {
+    const newNo = lessons.length + 1;
+    if (newNo > 12) {
+      setErrorMsg("A week plan is capped at a maximum of 12 lessons.");
+      return;
+    }
+    const newLesson = {
+      week: weekInput,
+      date: "",
+      time: "35 minutes",
+      lessonNumber: String(newNo),
+      class: "Grade 9",
+      subject: lessons[0]?.subject || "Biology",
+      strand: lessons[0]?.strand || "",
+      theme: lessons[0]?.theme || "",
+      subStrand: "New Subject Matter - Lesson Number " + newNo,
+      indicators: "",
+      processSkills: "",
+      knowledgeSkills: "",
+      keyCompetencies: {
+        practicingIslam: false,
+        managingSelf: false,
+        criticalThinking: false,
+        meaningMaking: false,
+        healthyLife: false,
+        sustainableDevelopment: false,
+        techMedia: false,
+        relatingPeople: false
+      },
+      progressionOfCompetencies: "",
+      bulletOutcomes: [""],
+      sharedValues: { self: false, community: false, family: false, environment: false },
+      activitiesSummary: "",
+      teachingAids: "",
+      resources: "",
+      priorKnowledge: "",
+      learningIntention: "",
+      successCriteria: "",
+      activityTable: [
+        { stepName: "Starter", successCriteria: "", learningActivity: "", time: "10 mins", assessment: "" },
+        { stepName: "Activity 1", successCriteria: "", learningActivity: "", time: "25 mins", assessment: "" }
+      ],
+      reflection: "",
+      preparedBy: (lessons[0] && lessons[0].preparedBy) ? { ...lessons[0].preparedBy } : { name: "", position: "", signature: "" },
+      checkedBy: (lessons[0] && lessons[0].checkedBy) ? { ...lessons[0].checkedBy } : { name: "", position: "", signature: "" }
+    };
+    setLessons([...lessons, newLesson]);
+    setActiveLessonIndex(newNo - 1);
+    setSuccessMsg("Added Lesson Number " + newNo + "!");
+  };
+
+  // Remove selected lesson
+  const removePeriod = (indexToRemove) => {
+    if (lessons.length <= 1) {
+      setErrorMsg("You must maintain at least one lesson plan.");
+      return;
+    }
+    const updated = lessons.filter((_, i) => i !== indexToRemove);
+    const reassigned = updated.map((les, idx) => {
+      const copy = { ...les };
+      copy.lessonNumber = String(idx + 1);
+      return copy;
+    });
+    setLessons(reassigned);
+    setActiveLessonIndex(0);
+    setSuccessMsg("Removed lesson plan. Remaining lesson plan sequence adjusted.");
+  };
+
+  // Extract and fill up to 12 separate lessons using target week parameters & search grounding
+  const triggerWeekAutoFill = async (weekToFetch) => {
+    if (!uploadedText && !externalDriveLink) {
+      setErrorMsg("Please upload a syllabus file or input a shared Drive link to search and extract from.");
+      return;
+    }
+    setLoading(true);
+    setErrorMsg("");
+    setSuccessMsg("");
+
+    try {
+      let extractedUrls = [];
+      if (uploadedText) {
+        const urlRegex = /(https?:\/\/[^\s]+)/g;
+        const matches = uploadedText.match(urlRegex);
+        if (matches) extractedUrls = [...matches];
+      }
+      if (externalDriveLink) {
+        extractedUrls.push(externalDriveLink);
+      }
+
+      const extraUrlContext = extractedUrls.join(", ");
+      const searchContext = uploadedText || "Syllabus lessons request for Week " + weekToFetch;
+
+      const parsedData = await callGeminiAPI(searchContext, weekToFetch, extraUrlContext);
+      if (parsedData && Array.isArray(parsedData.lessons) && parsedData.lessons.length > 0) {
+        const cleanedLessons = parsedData.lessons.map((structuredResult, idx) => {
+          return {
+            week: structuredResult.week || weekToFetch,
+            date: structuredResult.date || (lessons[0] && lessons[0].date) || "3/5/26",
+            time: "35 minutes", // Strictly overwrite or fallback directly to "35 minutes"
+            lessonNumber: String(idx + 1),
+            class: structuredResult.class || "Grade 9",
+            subject: structuredResult.subject || "Biology",
+            strand: structuredResult.strand || "",
+            theme: structuredResult.theme || "",
+            subStrand: structuredResult.subStrand || "",
+            indicators: structuredResult.indicators || "",
+            processSkills: structuredResult.processSkills || "",
+            knowledgeSkills: structuredResult.knowledgeSkills || "",
+            keyCompetencies: {
+              practicingIslam: !!structuredResult.keyCompetencies?.practicingIslam,
+              managingSelf: !!structuredResult.keyCompetencies?.managingSelf,
+              criticalThinking: !!structuredResult.keyCompetencies?.criticalThinking,
+              meaningMaking: !!structuredResult.keyCompetencies?.meaningMaking,
+              healthyLife: !!structuredResult.keyCompetencies?.healthyLife,
+              sustainableDevelopment: !!structuredResult.keyCompetencies?.sustainableDevelopment,
+              techMedia: !!structuredResult.keyCompetencies?.techMedia,
+              relatingPeople: !!structuredResult.keyCompetencies?.relatingPeople,
+            },
+            progressionOfCompetencies: structuredResult.progressionOfCompetencies || "",
+            bulletOutcomes: Array.isArray(structuredResult.bulletOutcomes) ? structuredResult.bulletOutcomes : [],
+            sharedValues: {
+              self: !!structuredResult.sharedValues?.self,
+              community: !!structuredResult.sharedValues?.community,
+              family: !!structuredResult.sharedValues?.family,
+              environment: !!structuredResult.sharedValues?.environment,
+            },
+            activitiesSummary: structuredResult.activitiesSummary || "",
+            teachingAids: structuredResult.teachingAids || "",
+            resources: structuredResult.resources || externalDriveLink || "",
+            priorKnowledge: structuredResult.priorKnowledge || "",
+            learningIntention: structuredResult.learningIntention || "",
+            successCriteria: structuredResult.successCriteria || "",
+            activityTable: Array.isArray(structuredResult.activityTable) ? structuredResult.activityTable : [],
+            reflection: structuredResult.reflection || "",
+            preparedBy: {
+              name: structuredResult.preparedBy?.name || (lessons[0] && lessons[0].preparedBy && lessons[0].preparedBy.name) || "",
+              position: structuredResult.preparedBy?.position || (lessons[0] && lessons[0].preparedBy && lessons[0].preparedBy.position) || "",
+              signature: structuredResult.preparedBy?.signature || (lessons[0] && lessons[0].preparedBy && lessons[0].preparedBy.signature) || ""
+            },
+            checkedBy: {
+              name: structuredResult.checkedBy?.name || (lessons[0] && lessons[0].checkedBy && lessons[0].checkedBy.name) || "",
+              position: structuredResult.checkedBy?.position || (lessons[0] && lessons[0].checkedBy && lessons[0].checkedBy.position) || "",
+              signature: structuredResult.checkedBy?.signature || (lessons[0] && lessons[0].checkedBy && lessons[0].checkedBy.signature) || ""
+            }
+          };
+        });
+
+        setLessons(cleanedLessons);
+        setActiveLessonIndex(0);
+        setSuccessMsg("Extracted " + cleanedLessons.length + " distinct lessons for Week " + weekToFetch + "! Lesson duration strictly set to \"35 minutes\".");
+      } else {
+        throw new Error("No structured lessons parsed. Please verify your week index query.");
+      }
+    } catch (err) {
+      setErrorMsg(err.message || "An error occurred while calling the AI Engine.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setLoading(true);
+    setErrorMsg("");
+    setSuccessMsg("");
+
+    try {
+      let extractedText = "";
+      const fileExtension = file.name.split('.').pop().toLowerCase();
+
+      if (fileExtension === 'txt') {
+        extractedText = await file.text();
+      } 
+      else if (fileExtension === 'docx') {
+        if (!window.mammoth) {
+          throw new Error("Word document processor is loading. Please try again in a moment.");
+        }
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await window.mammoth.extractRawText({ arrayBuffer });
+        extractedText = result.value;
+      } 
+      else if (fileExtension === 'xlsx' || fileExtension === 'xls' || fileExtension === 'csv') {
+        if (!window.XLSX) {
+          throw new Error("Spreadsheet parser is loading. Please try again in a moment.");
+        }
+        const arrayBuffer = await file.arrayBuffer();
+        const workbook = window.XLSX.read(arrayBuffer, { type: 'array' });
+        const firstSheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[firstSheetName];
+        extractedText = window.XLSX.utils.sheet_to_txt(worksheet);
+      } 
+      else if (fileExtension === 'pdf') {
+        if (!window.pdfjsLib) {
+          throw new Error("PDF processor is loading. Please try again in a moment.");
+        }
+        const arrayBuffer = await file.arrayBuffer();
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+        const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        
+        let textBuilder = "";
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map(item => item.str).join(" ");
+          textBuilder += `\n--- PAGE ${i} ---\n` + pageText;
+        }
+        extractedText = textBuilder;
+      } 
+      else {
+        throw new Error("Unsupported file format. Please upload PDF, Word (.docx), Excel (.xlsx), CSV, or text (.txt).");
+      }
+
+      if (!extractedText || extractedText.trim().length === 0) {
+        throw new Error("Could not extract text. Please ensure the file contains searchable digital text.");
+      }
+
+      setUploadedText(extractedText);
+      setUploadedFileName(file.name);
+
+      // Instantly run the targeted multi-lesson generator using target week input
+      await triggerWeekAutoFill(weekInput);
+
+    } catch (err) {
+      setErrorMsg(err.message || "An error occurred while uploading & parsing the file.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Triggers the AI generation process of the class worksheet for the active lesson with Worksheet Type
+  const generateClassWorksheet = async () => {
+    const activeLesson = lessons[activeLessonIndex];
+    if (!activeLesson) return;
+
+    setWorksheetLoading(true);
+    setErrorMsg("");
+    setSuccessMsg("");
+
+    const driveLinkContext = wsDriveLink || externalDriveLink || activeLesson.resources || "";
+    const lessonTopicContext = {
+      subject: activeLesson.subject,
+      class: activeLesson.class,
+      strand: activeLesson.strand,
+      theme: activeLesson.theme,
+      subStrand: activeLesson.subStrand,
+      indicators: activeLesson.indicators,
+      bulletOutcomes: activeLesson.bulletOutcomes
+    };
+
+    try {
+      const generatedData = await callGeminiWorksheetAPI(
+        lessonTopicContext,
+        driveLinkContext,
+        wsNumQuestions,
+        wsTimeLimit,
+        wsStudentLevel,
+        wsType,
+        wsGrade
+      );
+
+      const updated = [...lessons];
+      updated[activeLessonIndex].worksheet = {
+        title: generatedData.title || (activeLesson.subStrand + " Worksheet"),
+        instructions: generatedData.instructions || "Answer all questions cleanly in spaces provided.",
+        time: wsTimeLimit,
+        level: wsStudentLevel,
+        type: wsType,
+        grade: wsGrade,
+        questions: generatedData.questions || []
+      };
+
+      setLessons(updated);
+      setSuccessMsg("Successfully generated customized " + wsStudentLevel + " " + wsType + " for " + wsGrade + "! View it in Page 3 below.");
+    } catch (err) {
+      setErrorMsg(err.message || "Worksheet generation failed. Please try again.");
+    } finally {
+      setWorksheetLoading(false);
+    }
+  };
+
+  // Dedicated High-Fidelity Worksheet-only PDF/HTML direct exporter & download trigger
+  const handleExportWorksheetPDF = () => {
+    const activeLesson = lessons[activeLessonIndex];
+    if (!activeLesson || !activeLesson.worksheet) {
+      setErrorMsg("Please generate a worksheet first before attempting to export.");
+      return;
+    }
+
+    const ws = activeLesson.worksheet;
+
+    // Create a pristine, standalone, self-contained HTML handout file with auto-print capability
+    const printableDoc = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="utf-8">
+          <title>${ws.title}</title>
+          <style>
+            body { font-family: 'Helvetica Neue', Arial, sans-serif; padding: 40px; color: #1a202c; line-height: 1.5; background-color: #ffffff; }
+            .header-table { width: 100%; border-collapse: collapse; margin-bottom: 25px; margin-top: 15px; }
+            .header-table td { border: 1px solid #cbd5e0; padding: 10px; font-size: 10pt; }
+            .bg-green { background-color: #b7d7a8; font-weight: bold; color: #1a202c; }
+            .title { font-size: 16pt; font-weight: bold; text-align: center; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 0.5px; color: #2d3748; }
+            .instructions { font-style: italic; background-color: #f7fafc; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px; margin-bottom: 25px; font-size: 10pt; color: #4a5568; }
+            .question-block { margin-bottom: 30px; page-break-inside: avoid; }
+            .q-title { font-weight: bold; font-size: 11pt; margin-bottom: 8px; color: #2d3748; }
+            .points { color: #2b6cb0; font-size: 9.5pt; font-weight: normal; }
+            .q-text { font-size: 10.5pt; color: #2d3748; margin-bottom: 15px; white-space: pre-line; }
+            .dotted-line { border-bottom: 1px dotted #a0aec0; height: 30px; margin-top: 10px; width: 100%; }
+            .space-hint { font-size: 8.5pt; color: #718096; margin-top: 6px; font-style: italic; }
+            .page-break { page-break-before: always; }
+            .no-print { display: block; margin: 0 auto 20px auto; background-color: #2b6cb0; color: white; border: none; padding: 10px 20px; font-weight: bold; border-radius: 6px; cursor: pointer; font-size: 10.5pt; text-align: center; max-width: 200px; }
+            @media print {
+              .no-print { display: none !important; }
+              body { padding: 0; }
+            }
+          </style>
+        </head>
+        <body>
+          <button class="no-print" onclick="window.print()">Print or Save PDF</button>
+          <div class="title">${ws.title}</div>
+          <table class="header-table">
+            <tr>
+              <td class="bg-green" style="width: 18%;">Student Name</td>
+              <td style="width: 48%;"></td>
+              <td class="bg-green" style="width: 14%;">Date</td>
+              <td style="width: 20%;"></td>
+            </tr>
+            <tr>
+              <td class="bg-green">Subject / Class</td>
+              <td>${activeLesson.subject || 'Biology'} (${ws.grade || activeLesson.class || 'Grade 9'})</td>
+              <td class="bg-green">Time Limit</td>
+              <td>${ws.time}</td>
+            </tr>
+            <tr>
+              <td class="bg-green">Student Level</td>
+              <td>${ws.level}</td>
+              <td class="bg-green">Format</td>
+              <td>${ws.type}</td>
+            </tr>
+          </table>
+          
+          <div class="instructions">
+            <strong>Instructions:</strong> ${ws.instructions}
+          </div>
+          
+          ${ws.questions.map(q => `
+            <div class="question-block">
+              <div class="q-title">Question ${q.qNo} <span class="points">(${q.points})</span></div>
+              <div class="q-text">${q.questionText}</div>
+              <div class="dotted-line"></div>
+              <div class="dotted-line"></div>
+              <div class="dotted-line"></div>
+              <div class="space-hint">[${q.answerSpaceInstructions || 'Write your response above'}]</div>
+            </div>
+          `).join('')}
+          
+          <!-- Marking Guide Page -->
+          <div class="page-break"></div>
+          <div class="title" style="margin-top: 30px;">MARKING GUIDE & EXPECTED ANSWER OUTLINES</div>
+          <table class="header-table">
+            <tr class="bg-green">
+              <td style="width: 15%; text-align: center;">Q No.</td>
+              <td>Expected Ideal Solution / Grading Outline</td>
+            </tr>
+            ${ws.questions.map(q => `
+              <tr>
+                <td class="bg-green" style="text-align: center; font-weight: bold;">Q ${q.qNo}</td>
+                <td style="font-size: 10pt; padding: 12px; line-height: 1.5;">${q.expectedAnswer}</td>
+              </tr>
+            `).join('')}
+          </table>
+        </body>
+      </html>
+    `;
+
+    // Package the document content as a downloadable local HTML Handout package
+    const blob = new Blob([printableDoc], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${ws.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_printable_handout.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    
+    setSuccessMsg(`Successfully saved printable Handout file! Open "${ws.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_printable_handout.html" from your downloads folder to print or Save as PDF.`);
+  };
+
+  // ✨ LLM Outcomes & Indicators Aligner Tool
+  const triggerOutcomesGeneration = async () => {
+    const curLesson = lessons[activeLessonIndex];
+    if (!curLesson.subject || !curLesson.subStrand) {
+      setErrorMsg("Subject and Sub-Strand are required before generating aligned indicators.");
+      return;
+    }
+    setOutcomesLoading(true);
+    setErrorMsg("");
+    setSuccessMsg("");
+    try {
+      const result = await callGeminiOutcomesAPI(curLesson.subject, curLesson.strand, curLesson.subStrand);
+      const updated = [...lessons];
+      updated[activeLessonIndex] = {
+        ...curLesson,
+        indicators: result.indicators || curLesson.indicators,
+        processSkills: result.processSkills || curLesson.processSkills,
+        knowledgeSkills: result.knowledgeSkills || curLesson.knowledgeSkills,
+        bulletOutcomes: result.bulletOutcomes || curLesson.bulletOutcomes,
+        priorKnowledge: result.priorKnowledge || curLesson.priorKnowledge,
+        learningIntention: result.learningIntention || curLesson.learningIntention,
+        successCriteria: result.successCriteria || curLesson.successCriteria
+      };
+      setLessons(updated);
+      setSuccessMsg("✨ Automatically aligned and populated Outcomes, Indicators, and prior knowledge targets!");
+    } catch (err) {
+      setErrorMsg("Failed to align outcomes. Please verify input variables.");
+    } finally {
+      setOutcomesLoading(false);
+    }
+  };
+
+  // ✨ LLM Activities Expander & Differentiation Assistant with NCF & Maldives Cultural Infusions
+  const triggerActivitiesEnhancement = async () => {
+    const curLesson = lessons[activeLessonIndex];
+    if (!curLesson.subStrand) {
+      setErrorMsg("Please provide at least a Sub-Strand description first.");
+      return;
+    }
+    setActivitiesLoading(true);
+    setErrorMsg("");
+    setSuccessMsg("");
+    try {
+      const result = await callGeminiEnhanceActivitiesAPI(
+        curLesson.subject,
+        curLesson.strand,
+        curLesson.subStrand,
+        pedagogyStyle,
+        activitiesLevel,
+        curLesson.activityTable,
+        curLesson.keyCompetencies,
+        curLesson.sharedValues,
+        curLesson.class
+      );
+      const updated = [...lessons];
+      updated[activeLessonIndex] = {
+        ...curLesson,
+        activityTable: result.enhancedActivities || curLesson.activityTable,
+        teachingAids: result.teachingAids || curLesson.teachingAids,
+        activitiesSummary: result.activitiesSummary || curLesson.activitiesSummary,
+        reflection: result.reflection || curLesson.reflection
+      };
+      setLessons(updated);
+      setSuccessMsg("✨ Successfully enhanced activities into a detailed, customized \"" + pedagogyStyle + "\" format with Maldivian cultural anchors, National Curriculum Indicators, and illustrative whiteboard flowcharts!");
+    } catch (err) {
+      setErrorMsg("Failed to enhance activities. Please try again.");
+    } finally {
+      setActivitiesLoading(false);
+    }
+  };
+
+  // ✨ LLM Maldives Local Hook & Islamic Integration Generator
+  const triggerLocalHookGeneration = async () => {
+    const curLesson = lessons[activeLessonIndex];
+    if (!curLesson.subStrand) {
+      setErrorMsg("Please provide a lesson topic / Sub-Strand first.");
+      return;
+    }
+    setLocalHookLoading(true);
+    setErrorMsg("");
+    setSuccessMsg("");
+    try {
+      const hookText = await callGeminiLocalHookAPI(curLesson.subject, curLesson.strand, curLesson.subStrand);
+      updateField('progressionOfCompetencies', hookText);
+      setSuccessMsg("✨ Generated local Maldives context and Islamic value hook into Progression of Competencies!");
+    } catch (err) {
+      setErrorMsg("Failed to generate hook.");
+    } finally {
+      setLocalHookLoading(false);
+    }
+  };
+
+  // ✨ LLM Reflection notes generator
+  const triggerReflectionGeneration = async () => {
+    const curLesson = lessons[activeLessonIndex];
+    if (!curLesson.subStrand) {
+      setErrorMsg("Topic / Sub-Strand details are required.");
+      return;
+    }
+    setReflectionLoading(true);
+    setErrorMsg("");
+    setSuccessMsg("");
+    try {
+      const reflectionText = await callGeminiReflectionAPI(curLesson.subject, curLesson.subStrand, curLesson.activitiesSummary);
+      updateField('reflection', reflectionText);
+      setSuccessMsg("✨ Auto-generated post-lesson reflection notes using active parameters!");
+    } catch (err) {
+      setErrorMsg("Failed to generate reflection.");
+    } finally {
+      setReflectionLoading(false);
+    }
+  };
+
+  // High-fidelity Multi-Lesson Word EXPORTER that compiles HTML into a real Microsoft Word (*.docx) format.
+  // Rebuilt using robust ES5 String Concatenation to resolve all Nested Backtick and esbuild Compilation errors completely.
+  const handleExportDocx = () => {
+    const cssStyle = `
+      body { font-family: Arial, sans-serif; font-size: 9.5pt; line-height: 1.25; margin: 0; padding: 0; }
+      .container { width: 100%; margin: 0 auto; }
+      .period-separator-title { 
+        font-size: 13pt; 
+        font-weight: bold; 
+        text-align: center; 
+        margin-top: 30px; 
+        margin-bottom: 12px; 
+        font-family: Arial; 
+        text-transform: uppercase; 
+        color: #2c5282;
+        border-bottom: 2px solid #b7d7a8;
+        padding-bottom: 4px;
+      }
+      table.main-table { 
+        width: 100%; 
+        margin: 0 auto 25px auto; 
+        border-collapse: collapse; 
+        border: 1px solid #999999; 
+        font-family: Arial; 
+        font-size: 9pt; 
+      }
+      table.main-table td { 
+        border: 1px solid #999999; 
+        padding: 5px; 
+        vertical-align: middle; 
+      }
+      .bg-green { 
+        background-color: #b7d7a8 !important; 
+        font-weight: bold; 
+      }
+      .text-center { text-align: center; }
+      .text-left { text-align: left; }
+      .text-right { text-align: right; }
+      .bold-text { font-weight: bold; }
+      table.nested-checklist {
+        width: 100%;
+        border-collapse: collapse;
+        border: none;
+        margin: 0;
+      }
+      table.nested-checklist td {
+        border: 1px solid #999999;
+        padding: 4px 6px;
+        font-size: 8.5pt;
+        vertical-align: middle;
+      }
+      ul.outcome-bullets { 
+        margin: 0; 
+        padding-left: 18px; 
+      }
+      ul.outcome-bullets li {
+        margin-bottom: 3px;
+        font-size: 9pt;
+      }
+      .page-break { 
+        page-break-before: always; 
+        clear: both; 
+        height: 1px;
+      }
+    `;
+
+    let renderedLessonsHTML = "";
+
+    lessons.forEach((les, idx) => {
+      // Loop outcomes to append cleanly inside standard HTML concat block
+      let outcomesListHTML = "";
+      if (les.bulletOutcomes && Array.isArray(les.bulletOutcomes)) {
+        les.bulletOutcomes.forEach(bullet => {
+          if (bullet.trim() !== "") {
+            outcomesListHTML += '<li style="font-size: 9pt; margin-bottom: 3px;">' + bullet + '</li>';
+          }
+        });
+      }
+
+      // Loop activity steps cleanly
+      let activityRowsHTML = "";
+      if (les.activityTable && Array.isArray(les.activityTable)) {
+        les.activityTable.forEach(row => {
+          activityRowsHTML += '<tr>' +
+            '<td style="vertical-align: top; border: 1px solid #999999; padding: 5px; text-align: left;">' +
+              '<div class="bold-text" style="font-size: 9.5pt; font-weight: bold; margin-bottom: 2px;">' + (row.stepName || '') + '</div>' +
+              '<div style="font-size: 8.5pt; color: #444444;">' + (row.successCriteria || '') + '</div>' +
+            '</td>' +
+            '<td style="vertical-align: top; border: 1px solid #999999; padding: 5px; text-align: left; line-height: 1.35;">' + (row.learningActivity || '') + '</td>' +
+            '<td class="text-center" style="vertical-align: middle; font-weight: bold; border: 1px solid #999999; padding: 5px; text-align: center;">' + (row.time || '') + '</td>' +
+            '<td style="vertical-align: top; border: 1px solid #999999; padding: 5px; text-align: left;">' + (row.assessment || '') + '</td>' +
+          '</tr>';
+        });
+      }
+
+      // Build out standard Page 3 worksheet HTML if generated
+      let worksheetBlockHTML = "";
+      if (les.worksheet) {
+        let qsListHTML = "";
+        les.worksheet.questions.forEach(q => {
+          qsListHTML += '<tr>' +
+            '<td class="bg-green text-center" style="font-weight: bold; font-size: 10pt; vertical-align: top; width: 10%; background-color: #b7d7a8; border: 1px solid #999999; text-align: center; padding: 8px;">' + (q.qNo || '') + '</td>' +
+            '<td colspan="2" style="background-color: #ffffff; vertical-align: top; padding: 10px; border: 1px solid #999999; height: 120px; text-align: left;">' +
+              '<div style="font-weight: bold; font-size: 9.5pt; margin-bottom: 8px;">' +
+                (q.questionText || '') + ' <span style="color: #2c5282; font-size: 8.5pt;">(' + (q.points || '') + ')</span>' +
+              '</div>' +
+              '<div style="color: #a0aec0; font-size: 8pt; border-top: 1px dashed #e2e8f0; margin-top: 30px; padding-top: 4px;">' +
+                '[' + (q.answerSpaceInstructions || 'Write your response in the space above') + ']' +
+              '</div>' +
+            '</td>' +
+          '</tr>';
+        });
+
+        let answersKeyHTML = "";
+        les.worksheet.questions.forEach(q => {
+          answersKeyHTML += '<tr>' +
+            '<td class="bg-green text-center" style="width: 15%; font-weight: bold; background-color: #b7d7a8; border: 1px solid #999999; padding: 5px;">Q ' + (q.qNo || '') + ' Expected</td>' +
+            '<td style="background-color: #fcfcfc; padding: 6px; font-size: 8.5pt; border: 1px solid #999999; text-align: left;">' + (q.expectedAnswer || '') + '</td>' +
+          '</tr>';
+        });
+
+        worksheetBlockHTML = '<div class="page-break"></div>' +
+          '<div class="period-separator-title">CLASS WORKSHEET (' + (les.worksheet.type || 'Review') + ') — LESSON NUMBER ' + (les.lessonNumber || '') + '</div>' +
+          '<table class="main-table" style="margin-top: 10px; width: 100%; border-collapse: collapse; border: 1px solid #999999;">' +
+            '<tr><td colspan="3" class="bg-green text-center" style="height: 25px; font-size: 11pt; background-color: #b7d7a8; font-weight: bold; text-align: center; border: 1px solid #999999;">' + (les.worksheet.title || '') + '</td></tr>' +
+            '<tr>' +
+              '<td class="bg-green" style="width: 20%; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; padding: 5px; text-align: left;">Student level</td>' +
+              '<td style="width: 45%; font-weight: bold; background-color: #ffffff; border: 1px solid #999999; padding: 5px; text-align: left;">' + (les.worksheet.level || '') + '</td>' +
+              '<td style="padding: 0; width: 35%; border: 1px solid #999999;">' +
+                '<table style="width: 100%; border-collapse: collapse; border: none; margin: 0;">' +
+                  '<tr>' +
+                    '<td class="bg-green" style="width: 50%; border: none; border-right: 1px solid #999999; padding: 5px; background-color: #b7d7a8; font-weight: bold; text-align: left;">Time</td>' +
+                    '<td class="text-center" style="border: none; padding: 5px; font-weight: bold; background-color: #ffffff; text-align: center;">' + (les.worksheet.time || '') + '</td>' +
+                  '</tr>' +
+                '</table>' +
+              '</td>' +
+            '</tr>' +
+            '<tr><td colspan="3" style="background-color: #f7fafc; padding: 8px; font-style: italic; border: 1px solid #999999; text-align: left;"><strong>Instructions:</strong> ' + (les.worksheet.instructions || '') + '</td></tr>' +
+            qsListHTML +
+          '</table>' +
+          '<br/>' +
+          '<table class="main-table" style="margin-top: 15px; width: 100%; border-collapse: collapse; border: 1px solid #999999;">' +
+            '<tr><td colspan="2" class="bg-green text-center" style="height: 22px; background-color: #b7d7a8; font-weight: bold; text-align: center; border: 1px solid #999999;">Marking Guide / Answer Key</td></tr>' +
+            answersKeyHTML +
+          '</table>';
+      }
+
+      renderedLessonsHTML += '<!-- LESSON NUMBER Separator -->' +
+        '<div class="period-separator-title">LESSON NUMBER ' + (les.lessonNumber || '') + ' — LESSON PLAN</div>' +
+        '<table class="main-table" style="width: 100%; border-collapse: collapse; border: 1px solid #999999; margin-bottom: 25px; font-size: 9pt;">' +
+          '<tr><td colspan="6" class="bg-green text-center" style="height: 25px; font-size: 11pt; font-weight: bold; background-color: #b7d7a8; border: 1px solid #999999; text-align: center;">LESSON PLAN</td></tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="width: 15%; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Week</td>' +
+            '<td class="text-center" style="width: 18%; background-color: #ffffff; text-align: center; border: 1px solid #999999; padding: 5px;">' + (les.week || '') + '</td>' +
+            '<td class="bg-green" style="width: 15%; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Date</td>' +
+            '<td class="text-center" style="width: 18%; background-color: #ffffff; text-align: center; border: 1px solid #999999; padding: 5px;">' + (les.date || '') + '</td>' +
+            '<td class="bg-green" style="width: 15%; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Time</td>' +
+            '<td class="text-center font-bold" style="width: 19%; background-color: #ffffff; text-align: center; font-weight: bold; border: 1px solid #999999; padding: 5px;">' + (les.time || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Lesson Number</td>' +
+            '<td class="text-center" style="background-color: #ffffff; text-align: center; border: 1px solid #999999; padding: 5px;">' + (les.lessonNumber || '') + '</td>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Class</td>' +
+            '<td class="text-center" style="background-color: #ffffff; text-align: center; border: 1px solid #999999; padding: 5px;">' + (les.class || '') + '</td>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Subject</td>' +
+            '<td class="text-center font-bold" style="background-color: #ffffff; text-align: center; font-weight: bold; border: 1px solid #999999; padding: 5px;">' + (les.subject || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Topic / Strand</td>' +
+            '<td colspan="3" style="background-color: #ffffff; border: 1px solid #999999; padding: 5px; text-align: left;">' + (les.strand || '') + '</td>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Theme</td>' +
+            '<td style="background-color: #ffffff; border: 1px solid #999999; padding: 5px; text-align: left;">' + (les.theme || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Subtopic/Sub strand</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; padding: 5px; text-align: left;">' + (les.subStrand || '') + '</td>' +
+          '</tr>' +
+          '<tr><td colspan="6" class="bg-green text-center" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: center; height: 22px;">Indicators</td></tr>' +
+          '<tr><td colspan="6" style="background-color: #ffffff; border: 1px solid #999999; min-height: 45px; padding: 8px; vertical-align: top; text-align: left;">' + (les.indicators || '') + '</td></tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; font-size:9pt; text-align: left; padding: 5px;">Process skills</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; padding: 6px; vertical-align: top; text-align: left;">' + (les.processSkills || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; font-size:9pt; text-align: left; padding: 5px;">Knowledge skills</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; padding: 6px; vertical-align: top; text-align: left;">' + (les.knowledgeSkills || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td rowspan="2" class="bg-green text-left" style="width: 15%; vertical-align: middle; font-size: 10pt; font-weight: bold; background-color: #b7d7a8; border: 1px solid #999999; text-align: left; padding: 10px;">Key<br/>Competencies</td>' +
+            '<td colspan="5" style="padding: 0; border: 1px solid #999999; vertical-align: top;">' +
+              '<table style="width: 100%; border-collapse: collapse; border: none; margin: 0;">' +
+                '<tr><td colspan="4" style="font-weight: bold; font-size: 9.5pt; padding: 5px 8px; border-bottom: 1px solid #999999; background-color: #ffffff; text-align: left;">Key Competencies</td></tr>' +
+                '<tr>' +
+                  '<td style="width: 42%; border-left: none; border-top: none; border-bottom: 1px solid #999999; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt; text-align: left;">1. Practicing Islam</td>' +
+                  '<td style="width: 8%; text-align: center; font-weight: bold; border-top: none; border-bottom: 1px solid #999999; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt;">' + (les.keyCompetencies?.practicingIslam ? '✓' : '') + '</td>' +
+                  '<td style="width: 42%; border-top: none; border-bottom: 1px solid #999999; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt; text-align: left;">5. Living a Healthy Life</td>' +
+                  '<td style="width: 8%; border-top: none; border-bottom: 1px solid #999999; border-right: none; padding: 4px 6px; font-size: 8.5pt; text-align: center;">' + (les.keyCompetencies?.healthyLife ? '✓' : '') + '</td>' +
+                '</tr>' +
+                '<tr>' +
+                  '<td style="border-left: none; border-bottom: 1px solid #999999; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt; text-align: left;">2. Understanding and Managing Self</td>' +
+                  '<td style="text-align: center; font-weight: bold; border-bottom: 1px solid #999999; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt;">' + (les.keyCompetencies?.managingSelf ? '✓' : '') + '</td>' +
+                  '<td style="border-bottom: 1px solid #999999; border-right: none; padding: 4px 6px; font-size: 8.5pt; text-align: center;">6. Learning for Sustainable Development</td>' +
+                  '<td style="border-bottom: 1px solid #999999; border-right: none; padding: 4px 6px; font-size: 8.5pt; text-align: center;">' + (les.keyCompetencies?.sustainableDevelopment ? '✓' : '') + '</td>' +
+                '</tr>' +
+                '<tr>' +
+                  '<td style="border-left: none; border-bottom: 1px solid #999999; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt; text-align: left;">3. Thinking Critically and Creatively</td>' +
+                  '<td style="text-align: center; font-weight: bold; border-bottom: 1px solid #999999; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt;">' + (les.keyCompetencies?.criticalThinking ? '✓' : '') + '</td>' +
+                  '<td style="border-bottom: 1px solid #999999; border-right: none; padding: 4px 6px; font-size: 8.5pt; text-align: left;">7. Relating to People</td>' +
+                  '<td style="border-bottom: none; border-right: none; padding: 4px 6px; font-size: 8.5pt; text-align: center;">' + (les.keyCompetencies?.relatingPeople ? '✓' : '') + '</td>' +
+                '</tr>' +
+                '<tr>' +
+                  '<td style="border-left: none; border-bottom: none; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt; text-align: left;">4. Making Meaning</td>' +
+                  '<td style="text-align: center; font-weight: bold; border-bottom: none; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt;">' + (les.keyCompetencies?.meaningMaking ? '✓' : '') + '</td>' +
+                  '<td style="border-bottom: none; border-right: 1px solid #999999; padding: 4px 6px; font-size: 8.5pt; text-align: left;">7. Relating to People</td>' +
+                  '<td style="border-bottom: none; border-right: none; padding: 4px 6px; font-size: 8.5pt; text-align: center;">' + (les.keyCompetencies?.relatingPeople ? '✓' : '') + '</td>' +
+                '</tr>' +
+              '</table>' +
+            '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td colspan="2" class="bg-green text-left" style="font-size: 8.5pt; padding: 6px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left;">Progression of Key Competencies</td>' +
+            '<td colspan="4" style="background-color: #ffffff; border: 1px solid #999999; padding: 6px; vertical-align: top; text-align: left;">' + (les.progressionOfCompetencies || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; font-size:9.5pt; text-align: left; padding: 5px;">Outcomes</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; padding: 8px 12px; vertical-align: top; text-align: left;">' +
+              '<ul class="outcome-bullets" style="margin: 0; padding-left: 18px; list-style-type: disc;">' +
+                outcomesListHTML +
+              '</ul>' +
+            '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td rowspan="2" class="bg-green text-left" style="vertical-align: middle; font-size:9.5pt; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 10px;">Shared Values</td>' +
+            '<td colspan="5" style="padding: 0; border: 1px solid #999999; vertical-align: top;">' +
+              '<table style="width: 100%; border-collapse: collapse; border: none; margin: 0; font-size: 8.5pt;">' +
+                '<tr>' +
+                  '<td style="border-top: none; border-left: none; width: 42%; padding: 5px; border-bottom: 1px solid #999999; border-right: 1px solid #999999; text-align: left;">Values relating to self</td>' +
+                  '<td style="border-top: none; width: 8%; text-align: center; font-weight: bold; border-bottom: 1px solid #999999; border-right: 1px solid #999999; padding: 5px;">' + (les.sharedValues?.self ? '✓' : '') + '</td>' +
+                  '<td style="border-top: none; width: 42%; padding: 5px; border-bottom: 1px solid #999999; border-right: 1px solid #999999; text-align: left;">Values relating to local and global community</td>' +
+                  '<td style="border-top: none; border-right: none; width: 8%; text-align: center; font-weight: bold; border-bottom: 1px solid #999999; padding: 5px;">' + (les.sharedValues?.community ? '✓' : '') + '</td>' +
+                '</tr>' +
+                '<tr>' +
+                  '<td style="border-left: none; border-bottom: none; padding: 5px; border-right: 1px solid #999999; text-align: left;">Values relating to family and others</td>' +
+                  '<td style="border-bottom: none; text-align: center; font-weight: bold; border-right: 1px solid #999999; padding: 5px;">' + (les.sharedValues?.family ? '✓' : '') + '</td>' +
+                  '<td style="border-left: none; border-bottom: none; padding: 5px; border-right: 1px solid #999999; text-align: left;">Values relating to the environment</td>' +
+                  '<td style="border-right: none; border-bottom: none; text-align: center; font-weight: bold; padding: 5px;">' + (les.sharedValues?.environment ? '✓' : '') + '</td>' +
+                '</tr>' +
+              '</table>' +
+            '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td colspan="2" class="bg-green text-left" style="font-size: 9pt; padding: 5px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left;">Activities:</td>' +
+            '<td colspan="3" style="background-color: #ffffff; border: 1px solid #999999; padding: 5px; vertical-align: top; text-align: left;">' + (les.activitiesSummary || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Teaching Aids</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; min-height: 40px; vertical-align: top; padding: 5px; text-align: left;">' + (les.teachingAids || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Resources</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; min-height: 40px; vertical-align: top; padding: 5px; text-align: left;">' + (les.resources || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Prior Knowledge</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; min-height: 40px; vertical-align: top; padding: 5px; text-align: left;">' + (les.priorKnowledge || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Learning Intention</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; min-height: 40px; vertical-align: top; padding: 5px; text-align: left;">' + (les.learningIntention || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green" style="background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left; padding: 5px;">Success Criteria</td>' +
+            '<td colspan="5" style="background-color: #ffffff; border: 1px solid #999999; min-height: 40px; vertical-align: top; padding: 5px; text-align: left;">' + (les.successCriteria || '') + '</td>' +
+          '</tr>' +
+        '</table>' +
+        '<div class="page-break"></div>' +
+        '<table class="main-table" style="width: 100%; border-collapse: collapse; border: 1px solid #999999; margin-bottom: 25px;">' +
+          '<tr><td colspan="4" class="bg-green text-center" style="font-size: 10pt; height: 25px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: center;">Activity Table (Lesson Number ' + (les.lessonNumber || '') + ')</td></tr>' +
+          '<tr class="bg-green text-center" style="background-color: #b7d7a8; font-weight: bold;">' +
+            '<td style="width: 25%; border: 1px solid #999999; padding: 5px; text-align: left;">Success Criteria</td>' +
+            '<td style="width: 45%; border: 1px solid #999999; padding: 5px; text-align: left;">Learning Activity</td>' +
+            '<td style="width: 10%; border: 1px solid #999999; padding: 5px; text-align: center;">Time</td>' +
+            '<td style="width: 20%; border: 1px solid #999999; padding: 5px; text-align: left;">Assessment methods</td>' +
+          '</tr>' +
+          activityRowsHTML +
+          '<tr><td colspan="4" class="bg-green text-center" style="height: 22px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: center;">Reflection</td></tr>' +
+          '<tr><td colspan="4" style="min-height: 80px; vertical-align: top; padding: 8px; background-color: #ffffff; border: 1px solid #999999; text-align: left;">' + (les.reflection || '') + '</td></tr>' +
+        '</table>' +
+        '<table class="main-table" style="width: 100%; border-collapse: collapse; border: 1px solid #999999; margin-top: 15px;">' +
+          '<tr>' +
+            '<td colspan="2" class="bg-green text-center" style="width: 50%; font-size: 9.5pt; padding: 6px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: center;">Prepared by:</td>' +
+            '<td colspan="2" class="bg-green text-center" style="width: 50%; font-size: 9.5pt; padding: 6px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: center;">Checked by:</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green text-left" style="width: 15%; font-size: 9pt; padding: 5px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left;">Name</td>' +
+            '<td style="width: 35%; background-color: #ffffff; padding: 5px; border: 1px solid #999999; text-align: left;">' + (les.preparedBy?.name || '') + '</td>' +
+            '<td class="bg-green text-left" style="width: 15%; font-size: 9pt; padding: 5px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left;">Name</td>' +
+            '<td style="width: 35%; background-color: #ffffff; padding: 5px; border: 1px solid #999999; text-align: left;">' + (les.checkedBy?.name || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green text-left" style="width: 15%; font-size: 9pt; padding: 5px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left;">Signature</td>' +
+            '<td style="width: 35%; background-color: #ffffff; padding: 5px; border: 1px solid #999999; text-align: left; font-family: monospace;">' + (les.preparedBy?.signature || '') + '</td>' +
+            '<td class="bg-green text-left" style="width: 15%; font-size: 9pt; padding: 5px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left;">Signature</td>' +
+            '<td style="width: 35%; background-color: #ffffff; padding: 5px; border: 1px solid #999999; text-align: left; font-family: monospace;">' + (les.checkedBy?.signature || '') + '</td>' +
+          '</tr>' +
+          '<tr>' +
+            '<td class="bg-green text-left" style="width: 15%; font-size: 9pt; padding: 5px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left;">Position</td>' +
+            '<td style="width: 35%; background-color: #ffffff; padding: 5px; border: 1px solid #999999; text-align: left;">' + (les.preparedBy?.position || '') + '</td>' +
+            '<td class="bg-green text-left" style="width: 15%; font-size: 9pt; padding: 5px; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; text-align: left;">Position</td>' +
+            '<td style="width: 35%; background-color: #ffffff; padding: 5px; border: 1px solid #999999; text-align: left;">' + (les.checkedBy?.position || '') + '</td>' +
+          '</tr>' +
+        '</table>';
+        
+      renderedLessonsHTML += worksheetBlockHTML;
+
+      if (idx < lessons.length - 1) {
+        renderedLessonsHTML += '<div class="page-break"></div>';
+      }
+    });
+
+    const docContent = `
+      <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+      <head>
+        <meta charset="utf-8">
+        <title>Weekly Lessons Export</title>
+        <!--[if gte mso 9]>
+        <xml>
+          <w:WordDocument>
+            <w:View>Print</w:View>
+            <w:Zoom>100</w:Zoom>
+            <w:DoNotOptimizeForBrowser/>
+          </w:WordDocument>
+        </xml>
+        <![endif]-->
+        <style>${cssStyle}</style>
+      </head>
+      <body>
+        <div class="Section1">
+          ${renderedLessonsHTML}
+        </div>
+      </body>
+      </html>
+    `;
+
+    try {
+      const convertedBlob = window.htmlDocx.asBlob(docContent, {
+        orientation: 'portrait',
+        margins: { top: 720, bottom: 720, left: 720, right: 720 } 
+      });
+
+      const url = URL.createObjectURL(convertedBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = "weekly_lessons_plan_week_" + (lessons[0]?.week || "standard") + ".docx";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setSuccessMsg("Successfully exported standard Word Document (.docx) at true A4 dimensions with strict 0.5-inch margins!");
+    } catch (err) {
+      // Fallback if library fails
+      const fallbackBlob = new Blob(['\ufeff' + docContent], { type: 'application/msword' });
+      const urlFallback = URL.createObjectURL(fallbackBlob);
+      const aFallback = document.createElement('a');
+      aFallback.href = urlFallback;
+      aFallback.download = "weekly_lessons_plan_week_" + (lessons[0]?.week || "standard") + ".doc";
+      document.body.appendChild(aFallback);
+      aFallback.click();
+      document.body.removeChild(aFallback);
+      setSuccessMsg("Successfully downloaded standard Word Document (.doc) at true A4 dimensions with strict 0.5-inch margins!");
+    }
+  };
+
+  const handlePrint = () => {
+    window.print();
+  };
+
+  const activeLesson = lessons[activeLessonIndex] || lessons[0];
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col antialiased font-sans">
+      {/* Header Bar */}
+      <header className="border-b border-slate-800 bg-slate-950 px-6 py-4 flex flex-wrap justify-between items-center gap-4 sticky top-0 z-50">
+        <div className="flex items-center gap-3">
+          <div className="bg-emerald-500/10 p-2.5 rounded-xl border border-emerald-500/30">
+            <BookOpen className="w-6 h-6 text-emerald-400" />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold tracking-tight text-white flex items-center gap-2">
+              Lesson Plan Generator <span className="text-xs bg-emerald-500/20 text-emerald-400 font-semibold px-2 py-0.5 rounded-full border border-emerald-500/30">AI Enhanced</span>
+            </h1>
+            <p className="text-xs text-slate-400 font-sans">Stacks all week lessons (1–12) continuously on a single live sheet</p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          {/* AI Generator Trigger on Header */}
+          <button 
+            type="button" 
+            onClick={() => setIsWorksheetModalOpen(true)}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-emerald-300 hover:text-white bg-emerald-950/40 hover:bg-emerald-800/40 border border-emerald-500/30 rounded-lg transition-all"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+            Generate Worksheet
+          </button>
+
+          {/* Load Sample Data */}
+          <button 
+            type="button" 
+            onClick={() => {
+              setLessons(sampleLessons);
+              setActiveLessonIndex(0);
+              setSuccessMsg("Restored standard Mohawk Sifaz's Biology multi-lesson preview with 4 lessons!");
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition-all border border-slate-700"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Reset to Default (4 Lessons)
+          </button>
+
+          {/* Export to Word with A4 & 0.5-inch margins */}
+          <button 
+            type="button"
+            onClick={handleExportDocx}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white rounded-lg transition-all shadow-lg shadow-teal-900/20"
+          >
+            <Download className="w-4 h-4" />
+            Download for Word
+          </button>
+        </div>
+      </header>
+
+      {/* Main Workspace Layout */}
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
+        
+        {/* Left Side: Upload & Form Editor */}
+        <section className="lg:col-span-5 border-r border-slate-800 bg-slate-955 p-6 overflow-y-auto max-h-[calc(100vh-73px)] space-y-6">
+          
+          {/* AI Auto-Fill / Upload Box */}
+          <div className="bg-slate-900/80 rounded-xl border border-slate-700/60 p-4 space-y-3 shadow-inner">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                <Sparkles className="w-4.5 h-4.5 animate-pulse text-emerald-400" />
+                AI Auto-Fill & Week Extraction
+              </span>
+              <span className="text-[10px] text-slate-500">
+                PDF, Word, Excel, CSV, TXT
+              </span>
+            </div>
+            
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Upload curriculum or term documents. The engine extracts <strong>all lessons</strong> (defaults to 4 lessons, up to 12 lessons) scheduled for that specific week, generating a stack of filled continuous lesson sheets!
+            </p>
+
+            <div className="relative group border-2 border-dashed border-slate-700 hover:border-emerald-500/50 bg-slate-955 rounded-lg p-4 text-center cursor-pointer transition-all duration-150">
+              <input 
+                type="file" 
+                id="file-upload" 
+                accept=".pdf,.docx,.xlsx,.xls,.csv,.txt"
+                onChange={handleFileUpload} 
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" 
+              />
+              <div className="flex flex-col items-center gap-2">
+                <div className="p-2 bg-slate-800 rounded-full group-hover:bg-emerald-500/10 group-hover:text-emerald-400 transition-colors">
+                  <Upload className="w-5 h-5 text-slate-400" />
+                </div>
+                <div className="text-xs font-medium text-slate-300 group-hover:text-emerald-300">
+                  Upload Weekly Schedule Document
+                </div>
+                <div className="text-[10px] text-slate-500">
+                  {uploadedFileName ? "Cached file: " + uploadedFileName : "Extracts multiple sequential lesson sheets"}
+                </div>
+              </div>
+            </div>
+
+            {/* Target Week Picker & Shared Drive Input Tool */}
+            <div className="bg-slate-950/80 p-3 rounded-lg border border-slate-850 space-y-3 mt-2 animate-fadeIn">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-slate-300 flex items-center gap-1">
+                  <FileText className="w-3.5 h-3.5 text-indigo-400" />
+                  Target Week & External Resource Search
+                </span>
+              </div>
+              
+              <div className="space-y-2">
+                <div>
+                  <label className="block text-[10px] text-slate-400 mb-0.5">Target Week Number</label>
+                  <input 
+                    type="text"
+                    placeholder="e.g. 12, 35, Week 3"
+                    value={weekInput || ""}
+                    onChange={(e) => setWeekInput(e.target.value)}
+                    className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-xs text-black focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-slate-400 mb-0.5">Google Drive / Shared Link (Optional)</label>
+                  <input 
+                    type="text"
+                    placeholder="Paste shared Drive URL, folder, or resource link"
+                    value={externalDriveLink || ""}
+                    onChange={(e) => setExternalDriveLink(e.target.value)}
+                    className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-xs text-black focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+                
+                <button
+                  type="button"
+                  onClick={() => triggerWeekAutoFill(weekInput)}
+                  disabled={loading || (!uploadedText && !externalDriveLink)}
+                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-xs py-2 rounded transition-colors flex items-center justify-center gap-1.5 disabled:opacity-40"
+                  title={!uploadedText && !externalDriveLink ? "Please upload a document guide or paste a Drive Link first" : ""}
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  Extract & Search-Augment Lessons
+                </button>
+              </div>
+            </div>
+
+            {loading && (
+              <div className="flex items-center gap-2.5 bg-indigo-950/40 border border-indigo-500/30 p-3 rounded-lg text-xs text-indigo-200">
+                <div className="animate-spin rounded-full h-4.5 w-4.5 border-2 border-white border-t-transparent" />
+                <span>AI Grounding Engine is researching topics & building descriptive classroom flows...</span>
+              </div>
+            )}
+
+            {errorMsg && (
+              <div className="flex items-start gap-2 bg-red-950/40 border border-red-500/30 p-3 rounded-lg text-xs text-red-200">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
+
+            {successMsg && (
+              <div className="flex items-start gap-2 bg-emerald-950/40 border border-emerald-500/30 p-3 rounded-lg text-xs text-emerald-200">
+                <Check className="w-4 h-4 mt-0.5 shrink-0" />
+                <span>{successMsg}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Lesson Selector / Actions */}
+          <div className="bg-slate-900 rounded-xl border border-slate-800 p-3.5 space-y-2.5">
+            <div className="flex justify-between items-center border-b border-slate-800 pb-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-teal-400">WEEK LESSON NUMBER SELECTION</span>
+              <button
+                type="button"
+                onClick={addNewPeriod}
+                className="flex items-center gap-1 text-[11px] bg-teal-600/25 text-teal-300 hover:bg-teal-600/40 border border-teal-500/30 px-2.5 py-1 rounded"
+              >
+                <Plus className="w-3 h-3" /> Add Lesson Plan
+              </button>
+            </div>
+            
+            <div className="flex flex-wrap gap-2">
+              {lessons.map((les, index) => (
+                <div 
+                  key={index} 
+                  className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 cursor-pointer text-xs transition-all \${
+                    activeLessonIndex === index 
+                      ? 'bg-teal-600 border-teal-500 text-white shadow shadow-teal-900/40' 
+                      : 'bg-slate-955 border-slate-850 hover:bg-slate-800 text-slate-300'
+                  }`}
+                  onClick={() => setActiveLessonIndex(index)}
+                >
+                  <span>Lesson Number {les.lessonNumber || index + 1}</span>
+                  {lessons.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removePeriod(index);
+                      }}
+                      className="text-slate-400 hover:text-red-400 p-0.5 transition-colors"
+                      title="Remove plan"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Form Fields for Selected active lesson */}
+          {activeLesson && (
+            <div className="space-y-5">
+              <div className="text-xs text-teal-400 font-semibold uppercase tracking-wider">
+                Editing: Lesson Number {activeLesson.lessonNumber} Lesson Parameters
+              </div>
+
+              {/* Form Navigation Tabs */}
+              <div className="flex border-b border-slate-800 gap-1 text-sm">
+                <button 
+                  type="button"
+                  onClick={() => setActiveTab('meta')}
+                  className={`pb-2 px-3 font-medium border-b-2 transition-colors \${activeTab === 'meta' ? 'border-teal-500 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
+                >
+                  Meta & Topic
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => setActiveTab('competencies')}
+                  className={`pb-2 px-3 font-medium border-b-2 transition-colors \${activeTab === 'competencies' ? 'border-teal-500 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
+                >
+                  Goals
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => setActiveTab('outcomes')}
+                  className={`pb-2 px-3 font-medium border-b-2 transition-colors \${activeTab === 'outcomes' ? 'border-teal-500 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
+                >
+                  Outcomes
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => setActiveTab('activities')}
+                  className={`pb-2 px-3 font-medium border-b-2 transition-colors \${activeTab === 'activities' ? 'border-teal-500 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
+                >
+                  Activities
+                </button>
+              </div>
+
+              {/* Tab 1: Meta */}
+              {activeTab === 'meta' && (
+                <div className="space-y-4 animate-fadeIn">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Week</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.week || ""} 
+                        onChange={(e) => updateField('week', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Date</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.date || ""} 
+                        onChange={(e) => updateField('date', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Time</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.time || "35 minutes"} 
+                        onChange={(e) => updateField('time', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black font-bold focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Lesson Number</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.lessonNumber || ""} 
+                        onChange={(e) => updateField('lessonNumber', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Class</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.class || ""} 
+                        onChange={(e) => updateField('class', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Subject</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.subject || ""} 
+                        onChange={(e) => updateField('subject', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black font-bold focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-3 pt-2">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Topic / Strand</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.strand || ""} 
+                        onChange={(e) => updateField('strand', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Theme</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.theme || ""} 
+                        onChange={(e) => updateField('theme', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Subtopic/Sub strand</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.subStrand || ""} 
+                        onChange={(e) => updateField('subStrand', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Tab 2: Competencies */}
+              {activeTab === 'competencies' && (
+                <div className="space-y-4 animate-fadeIn">
+                  
+                  {/* ✨ AI Maldives Islamic and Local Hook Assistant */}
+                  <div className="bg-slate-900/80 p-3.5 rounded-xl border border-teal-500/20 shadow-lg space-y-3">
+                    <div className="flex items-center gap-1.5 text-teal-400 font-semibold text-xs uppercase tracking-wider">
+                      <Sparkles className="w-4.5 h-4.5 animate-pulse" />
+                      ✨ AI Maldives Local & Islamic Value Hook
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-snug">
+                      Generate a solid Maldives-aligned contextual link and Islamic integration statement directly based on topic: <strong>{activeLesson.subStrand || "(None)"}</strong>
+                    </p>
+                    <button
+                      type="button"
+                      onClick={triggerLocalHookGeneration}
+                      disabled={localHookLoading}
+                      className="w-full py-2 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white rounded font-bold text-xs transition-all flex items-center justify-center gap-1.5 disabled:opacity-40"
+                    >
+                      {localHookLoading ? (
+                        <>
+                          <div className="animate-spin rounded-full h-3.5 w-3.5 border-2 border-white border-t-transparent" />
+                          Contextualizing curriculum indicators...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-4 h-4" />
+                          Generate Local & Islamic Hook
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  <h3 className="text-xs font-semibold text-slate-300">Key Competencies Checklist</h3>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-900 p-3 rounded-lg border border-slate-800">
+                    {[
+                      { key: 'practicingIslam', label: '1. Practicing Islam' },
+                      { key: 'managingSelf', label: '2. Understanding and Managing Self' },
+                      { key: 'criticalThinking', label: '3. Thinking Critically and Creatively' },
+                      { key: 'meaningMaking', label: '4. Making Meaning' },
+                      { key: 'healthyLife', label: '5. Living a Healthy Life' },
+                      { key: 'sustainableDevelopment', label: '6. Learning for Sustainable Development' },
+                      { key: 'techMedia', label: '6. Using Technology and Media' },
+                      { key: 'relatingPeople', label: '7. Relating to People' }
+                    ].map((item) => (
+                      <label key={item.key} className="flex items-center gap-2.5 p-1.5 hover:bg-slate-800 rounded cursor-pointer transition-colors text-xs text-slate-300">
+                        <input 
+                          type="checkbox"
+                          checked={activeLesson.keyCompetencies?.[item.key] || false}
+                          onChange={(e) => updateNestedField('keyCompetencies', item.key, e.target.checked)}
+                          className="rounded border-slate-700 text-teal-600 focus:ring-teal-500 bg-slate-900 h-4 w-4"
+                        />
+                        <span>{item.label}</span>
+                      </label>
+                    ))}
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1">Progression of Key Competencies</label>
+                    <textarea 
+                      rows={2}
+                      value={activeLesson.progressionOfCompetencies || ""}
+                      onChange={(e) => updateField('progressionOfCompetencies', e.target.value)}
+                      className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                    />
+                  </div>
+
+                  <h3 className="text-xs font-semibold text-slate-300 pt-1">Shared Values</h3>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-900 p-3 rounded-lg border border-slate-800">
+                    {[
+                      { key: 'self', label: 'Values relating to self' },
+                      { key: 'community', label: 'Values relating to community' },
+                      { key: 'family', label: 'Values relating to family & others' },
+                      { key: 'environment', label: 'Values relating to the environment' }
+                    ].map((item) => (
+                      <label key={item.key} className="flex items-center gap-2.5 p-1.5 hover:bg-slate-800 rounded cursor-pointer transition-colors text-xs text-slate-300">
+                        <input 
+                          type="checkbox"
+                          checked={activeLesson.sharedValues?.[item.key] || false}
+                          onChange={(e) => updateNestedField('sharedValues', item.key, e.target.checked)}
+                          className="rounded border-slate-700 text-teal-600 focus:ring-teal-500 bg-slate-900 h-4 w-4"
+                        />
+                        <span>{item.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Tab 3: Outcomes */}
+              {activeTab === 'outcomes' && (
+                <div className="space-y-4 animate-fadeIn">
+                  
+                  {/* ✨ AI Outcomes & Indicators Aligner Tool */}
+                  <div className="bg-slate-900/80 p-3.5 rounded-xl border border-teal-500/20 shadow-lg space-y-3">
+                    <div className="flex items-center gap-1.5 text-teal-400 font-semibold text-xs uppercase tracking-wider">
+                      <Sparkles className="w-4.5 h-4.5 animate-pulse" />
+                      ✨ AI Indicator Aligner
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-snug">
+                      Instantly map and align indicator targets, prior knowledge hooks, and success criteria matching current topic: <strong>{activeLesson.subStrand || "(No topic entered)"}</strong>
+                    </p>
+                    <button
+                      type="button"
+                      onClick={triggerOutcomesGeneration}
+                      disabled={outcomesLoading}
+                      className="w-full py-2 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white rounded font-bold text-xs transition-all flex items-center justify-center gap-1.5 disabled:opacity-40"
+                    >
+                      {outcomesLoading ? (
+                        <>
+                          <div className="animate-spin rounded-full h-3.5 w-3.5 border-2 border-white border-t-transparent" />
+                          Aligning curriculum structures...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-4 h-4" />
+                          Generate Aligned Outcomes & Indicators
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-400 mb-1">Bullet Outcomes (One per line)</label>
+                    <textarea 
+                      rows={3}
+                      value={(activeLesson.bulletOutcomes || []).join('\n')}
+                      onChange={(e) => updateField('bulletOutcomes', e.target.value.split('\n'))}
+                      className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black font-mono text-xs focus:outline-none focus:ring-2 focus:ring-teal-500"
+                    />
+                  </div>
+
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Indicators Header Content</label>
+                      <textarea 
+                        rows={2}
+                        value={activeLesson.indicators || ""} 
+                        onChange={(e) => updateField('indicators', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Activities (Shared Values sub-section)</label>
+                      <textarea 
+                        rows={2}
+                        value={activeLesson.activitiesSummary || ""} 
+                        onChange={(e) => updateField('activitiesSummary', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Tab 4: Activities Grid */}
+              {activeTab === 'activities' && (
+                <div className="space-y-4 animate-fadeIn font-sans">
+                  
+                  {/* ✨ AI Activity Expander & Differentiate Activities with Maldives localized indicators, checked values, and whiteboard diagrams */}
+                  <div className="bg-slate-900/80 p-3.5 rounded-xl border border-teal-500/20 shadow-lg space-y-3">
+                    <div className="flex items-center gap-1.5 text-teal-400 font-semibold text-xs uppercase tracking-wider">
+                      <Sparkles className="w-4.5 h-4.5 animate-pulse" />
+                      ✨ AI Activity Expander
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-snug">
+                      Analyze active Maldives Key Competencies, Shared Values and generate localized activities explained with detailed whiteboard text/ASCII explanatory diagrams.
+                    </p>
+
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <div>
+                        {/* Modified dropdown loaded with custom methods requested by the user */}
+                        <label className="block text-[10px] text-slate-400 mb-1">Pedagogy Style</label>
+                        <select
+                          value={pedagogyStyle}
+                          onChange={(e) => setPedagogyStyle(e.target.value)}
+                          className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                        >
+                          <option value="Lecturing, drills, and standardized testing">Lecturing, drills, and standardized testing</option>
+                          <option value="Montessori methods, inquiry-based learning, and hands-on experiments">Montessori methods, inquiry-based learning, and hands-on experiments</option>
+                          <option value="Group projects, peer reviews, and collaborative problem-solving">Group projects, peer reviews, and collaborative problem-solving</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[10px] text-slate-400 mb-1">Student Level</label>
+                        <select
+                          value={activitiesLevel}
+                          onChange={(e) => setActivitiesLevel(e.target.value)}
+                          className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                        >
+                          <option value="Normal">Normal (Standard)</option>
+                          <option value="ICP">ICP (Scaffolded Supports)</option>
+                          <option value="lower level">Lower Level (Direct Recall)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={triggerActivitiesEnhancement}
+                      disabled={activitiesLoading}
+                      className="w-full py-2 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white rounded font-bold text-xs transition-all flex items-center justify-center gap-1.5 disabled:opacity-40"
+                    >
+                      {activitiesLoading ? (
+                        <>
+                          <div className="animate-spin rounded-full h-3.5 w-3.5 border-2 border-white border-t-transparent" />
+                          Structuring specialized NCF activities...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-4 h-4" />
+                          AI Expand & Differentiate Activities
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  <div className="flex justify-between items-center border-b border-slate-800 pb-1">
+                    <span className="text-xs font-bold text-slate-300">Activity Table Blocks</span>
+                    <button 
+                      type="button"
+                      onClick={addActivityRow}
+                      className="text-[10px] bg-slate-800 border border-slate-700 px-2 py-0.5 rounded text-teal-400"
+                    >
+                      + Add Step
+                    </button>
+                  </div>
+
+                  {(activeLesson.activityTable || []).map((row, index) => (
+                    <div key={index} className="bg-slate-900/60 p-3 rounded-lg border border-slate-800 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <input 
+                          type="text" 
+                          value={row.stepName || ""}
+                          onChange={(e) => updateActivityRow(index, 'stepName', e.target.value)}
+                          className="bg-white font-bold border border-slate-300 rounded text-xs px-2 py-1 text-black focus:ring-2 focus:ring-teal-500"
+                        />
+                        <div className="flex items-center gap-2">
+                          <input 
+                            type="text" 
+                            value={row.time || ""}
+                            onChange={(e) => updateActivityRow(index, 'time', e.target.value)}
+                            className="bg-white border border-slate-300 rounded text-xs px-2 py-1 text-black w-20 text-center focus:ring-2 focus:ring-teal-500"
+                          />
+                          <button 
+                            type="button"
+                            onClick={() => removeActivityRow(index)}
+                            className="text-red-400 hover:text-red-300 text-xs px-1"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+                      <div className="space-y-1.5 text-xs">
+                        <input 
+                          type="text" 
+                          value={row.successCriteria || ""}
+                          placeholder="Success Criteria"
+                          onChange={(e) => updateActivityRow(index, 'successCriteria', e.target.value)}
+                          className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-black focus:ring-2 focus:ring-teal-500"
+                        />
+                        <textarea 
+                          rows={6}
+                          value={row.learningActivity || ""}
+                          placeholder="Learning Activity Content & Whiteboard Diagram"
+                          onChange={(e) => updateActivityRow(index, 'learningActivity', e.target.value)}
+                          className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-black font-sans focus:ring-2 focus:ring-teal-500"
+                        />
+                        <input 
+                          type="text" 
+                          value={row.assessment || ""}
+                          placeholder="Assessment methods"
+                          onChange={(e) => updateActivityRow(index, 'assessment', e.target.value)}
+                          className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-black focus:ring-2 focus:ring-teal-500"
+                        />
+                      </div>
+                    </div>
+                  ))}
+
+                  <div className="space-y-3 pt-2">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Teaching Aids</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.teachingAids || ""} 
+                        onChange={(e) => updateField('teachingAids', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Resources & Drive Links</label>
+                      <input 
+                        type="text" 
+                        value={activeLesson.resources || ""} 
+                        onChange={(e) => updateField('resources', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Prior Knowledge</label>
+                      <textarea 
+                        rows={2}
+                        value={activeLesson.priorKnowledge || ""} 
+                        onChange={(e) => updateField('priorKnowledge', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Learning Intention</label>
+                      <textarea 
+                        rows={2}
+                        value={activeLesson.learningIntention || ""} 
+                        onChange={(e) => updateField('learningIntention', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Success Criteria Overview</label>
+                      <textarea 
+                        rows={2}
+                        value={activeLesson.successCriteria || ""} 
+                        onChange={(e) => updateField('successCriteria', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-800">
+                      <div className="space-y-2 bg-slate-900/50 p-2.5 rounded-lg border border-slate-850">
+                        <span className="text-xs font-bold text-teal-400">Prepared By:</span>
+                        <div>
+                          <label className="block text-[10px] text-slate-400">Name</label>
+                          <input 
+                            type="text" 
+                            value={activeLesson.preparedBy?.name || ""}
+                            onChange={(e) => updateNestedField('preparedBy', 'name', e.target.value)}
+                            className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-xs text-black focus:ring-2 focus:ring-teal-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-slate-400">Signature</label>
+                          <input 
+                            type="text" 
+                            value={activeLesson.preparedBy?.signature || ""}
+                            onChange={(e) => updateNestedField('preparedBy', 'signature', e.target.value)}
+                            className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-xs text-black focus:ring-2 focus:ring-teal-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-slate-400">Position</label>
+                          <input 
+                            type="text" 
+                            value={activeLesson.preparedBy?.position || ""}
+                            onChange={(e) => updateNestedField('preparedBy', 'position', e.target.value)}
+                            className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-xs text-black focus:ring-2 focus:ring-teal-500"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-2 bg-slate-900/50 p-2.5 rounded-lg border border-slate-850">
+                        <span className="text-xs font-bold text-teal-400">Checked By:</span>
+                        <div>
+                          <label className="block text-[10px] text-slate-400">Name</label>
+                          <input 
+                            type="text" 
+                            value={activeLesson.checkedBy?.name || ""}
+                            onChange={(e) => updateNestedField('checkedBy', 'name', e.target.value)}
+                            className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-xs text-black focus:ring-2 focus:ring-teal-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-slate-400">Signature</label>
+                          <input 
+                            type="text" 
+                            value={activeLesson.checkedBy?.signature || ""}
+                            onChange={(e) => updateNestedField('checkedBy', 'signature', e.target.value)}
+                            className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-xs text-black focus:ring-2 focus:ring-teal-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] text-slate-400">Position</label>
+                          <input 
+                            type="text" 
+                            value={activeLesson.checkedBy?.position || ""}
+                            onChange={(e) => updateNestedField('checkedBy', 'position', e.target.value)}
+                            className="w-full bg-white border border-slate-300 rounded px-2 py-1 text-xs text-black focus:ring-2 focus:ring-teal-500"
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* ✨ AI Automated Lesson Reflection Generator Button */}
+                    <div className="bg-slate-900/80 p-3.5 rounded-xl border border-teal-500/20 shadow-lg space-y-3 mt-4">
+                      <div className="flex items-center gap-1.5 text-teal-400 font-semibold text-xs uppercase tracking-wider">
+                        <Sparkles className="w-4.5 h-4.5 animate-pulse" />
+                        ✨ AI Reflection Generator
+                      </div>
+                      <p className="text-[11px] text-slate-400 leading-snug">
+                        Struggling with reflection drafting? Automatically analyze your active outcomes, activities, and student levels to formulate highly accurate, post-lesson feedback notes.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={triggerReflectionGeneration}
+                        disabled={reflectionLoading}
+                        className="w-full py-2 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white rounded font-bold text-xs transition-all flex items-center justify-center gap-1.5 disabled:opacity-40"
+                      >
+                        {reflectionLoading ? (
+                          <>
+                            <div className="animate-spin rounded-full h-3.5 w-3.5 border-2 border-white border-t-transparent" />
+                            Evaluating engagement & drafting reflection...
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="w-4 h-4" />
+                            Generate Custom Lesson Reflection
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1">Reflection Notes</label>
+                      <textarea 
+                        rows={2}
+                        value={activeLesson.reflection || ""} 
+                        onChange={(e) => updateField('reflection', e.target.value)}
+                        className="w-full bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+        </section>
+
+        {/* Right Side: Document Preview Canvas (Stacked continuous layout for all active lessons) */}
+        <section className="lg:col-span-7 bg-slate-800 p-6 overflow-y-auto max-h-[calc(100vh-73px)] flex justify-center preview-container">
+          
+          <div className="space-y-8 max-w-[800px] w-full">
+            <div className="flex items-center justify-between text-xs text-slate-400 font-mono select-none px-2">
+              <span className="flex items-center gap-1.5"><Eye className="w-4.5 h-4.5 text-teal-400" /> Live High-Fidelity Canvas</span>
+              <span>All Continuous Lesson Sheets Stacked ({lessons.length} Lessons)</span>
+            </div>
+
+            {/* Loop and stack all created/active lesson plans */}
+            {lessons.map((les, index) => {
+              // Loop outcomes to append cleanly inside standard HTML concat block
+              let outcomesListHTML = "";
+              if (les.bulletOutcomes && Array.isArray(les.bulletOutcomes)) {
+                les.bulletOutcomes.forEach((bullet, bIdx) => {
+                  if (bullet.trim() !== "") {
+                    outcomesListHTML += '<li key=' + bIdx + '>' + bullet + '</li>';
+                  }
+                });
+              }
+
+              // Loop activity steps cleanly
+              let activityRowsHTML = "";
+              if (les.activityTable && Array.isArray(les.activityTable)) {
+                les.activityTable.forEach((row, rIdx) => {
+                  activityRowsHTML += '<tr key=' + rIdx + '>' +
+                    '<td style="vertical-align: top; border: 1px solid #999999; padding: 5px; text-align: left;">' +
+                      '<div class="bold-text" style="font-size: 9.5pt; font-weight: bold; margin-bottom: 2px;">' + (row.stepName || '') + '</div>' +
+                      '<div style="font-size: 8.5pt; color: #444444;">' + (row.successCriteria || '') + '</div>' +
+                    '</td>' +
+                    '<td style="vertical-align: top; border: 1px solid #999999; padding: 5px; text-align: left; line-height: 1.35; white-space: pre-wrap;">' + (row.learningActivity || '') + '</td>' +
+                    '<td class="text-center" style="vertical-align: middle; font-weight: bold; border: 1px solid #999999; padding: 5px; text-align: center;">' + (row.time || '') + '</td>' +
+                    '<td style="vertical-align: top; border: 1px solid #999999; padding: 5px; text-align: left;">' + (row.assessment || '') + '</td>' +
+                  '</tr>';
+                });
+              }
+
+              // Build out standard Page 3 worksheet HTML if generated
+              let worksheetBlockHTML = "";
+              if (les.worksheet) {
+                let qsListHTML = "";
+                les.worksheet.questions.forEach((q, qIdx) => {
+                  qsListHTML += '<tr key=' + qIdx + '>' +
+                    '<td class="bg-green text-center" style="font-weight: bold; font-size: 10pt; vertical-align: top; width: 10%; background-color: #b7d7a8; border: 1px solid #999999; text-align: center; padding: 8px;">' + (q.qNo || '') + '</td>' +
+                    '<td colspan="2" style="background-color: #ffffff; vertical-align: top; padding: 10px; border: 1px solid #999999; height: 120px; text-align: left;">' +
+                      '<div style="font-weight: bold; font-size: 9.5pt; margin-bottom: 8px;">' +
+                        (q.questionText || '') + ' <span style="color: #2c5282; font-size: 8.5pt;">(' + (q.points || '') + ')</span>' +
+                      '</div>' +
+                      '<div style="color: #a0aec0; font-size: 8pt; border-top: 1px dashed #e2e8f0; margin-top: 30px; padding-top: 4px;">' +
+                        '[' + (q.answerSpaceInstructions || 'Write your response in the space above') + ']' +
+                      '</div>' +
+                    '</td>' +
+                  '</tr>';
+                });
+
+                let answersKeyHTML = "";
+                les.worksheet.questions.forEach((q, aIdx) => {
+                  answersKeyHTML += '<tr key=' + aIdx + '>' +
+                    '<td class="bg-green text-center" style="width: 15%; font-weight: bold; background-color: #b7d7a8; border: 1px solid #999999; padding: 5px;">Q ' + (q.qNo || '') + ' Expected</td>' +
+                    '<td style="background-color: #fcfcfc; padding: 6px; font-size: 8.5pt; border: 1px solid #999999; text-align: left;">' + (q.expectedAnswer || '') + '</td>' +
+                  '</tr>';
+                });
+
+                worksheetBlockHTML = '<div class="page-break"></div>' +
+                  '<div class="period-separator-title">CLASS WORKSHEET (' + (les.worksheet.type || 'Review') + ') — LESSON NUMBER ' + (les.lessonNumber || '') + '</div>' +
+                  '<table class="main-table" style="margin-top: 10px; width: 100%; border-collapse: collapse; border: 1px solid #999999;">' +
+                    '<tr><td colspan="3" class="bg-green text-center" style="height: 25px; font-size: 11pt; background-color: #b7d7a8; font-weight: bold; text-align: center; border: 1px solid #999999;">' + (les.worksheet.title || '') + '</td></tr>' +
+                    '<tr>' +
+                      '<td class="bg-green" style="width: 20%; background-color: #b7d7a8; font-weight: bold; border: 1px solid #999999; padding: 5px; text-align: left;">Student level</td>' +
+                      '<td style="width: 45%; font-weight: bold; background-color: #ffffff; border: 1px solid #999999; padding: 5px; text-align: left;">' + (les.worksheet.level || '') + '</td>' +
+                      '<td style="padding: 0; width: 35%; border: 1px solid #999999;">' +
+                        '<table style="width: 100%; border-collapse: collapse; border: none; margin: 0;">' +
+                          '<tr>' +
+                            '<td class="bg-green" style="width: 50%; border: none; border-right: 1px solid #999999; padding: 5px; background-color: #b7d7a8; font-weight: bold; text-align: left;">Time</td>' +
+                            '<td class="text-center" style="border: none; padding: 5px; font-weight: bold; background-color: #ffffff; text-align: center;">' + (les.worksheet.time || '') + '</td>' +
+                          '</tr>' +
+                        '</table>' +
+                      '</td>' +
+                    '</tr>' +
+                    '<tr><td colspan="3" style="background-color: #f7fafc; padding: 8px; font-style: italic; border: 1px solid #999999; text-align: left;"><strong>Instructions:</strong> ' + (les.worksheet.instructions || '') + '</td></tr>' +
+                    qsListHTML +
+                  '</table>' +
+                  '<br/>' +
+                  '<table class="main-table" style="margin-top: 15px; width: 100%; border-collapse: collapse; border: 1px solid #999999;">' +
+                    '<tr><td colspan="2" class="bg-green text-center" style="height: 22px; background-color: #b7d7a8; font-weight: bold; text-align: center; border: 1px solid #999999;">Marking Guide / Answer Key</td></tr>' +
+                    answersKeyHTML +
+                  '</table>';
+              }
+
+              return (
+                <div key={index} className="space-y-8 relative group border-t-4 border-teal-500 pt-6">
+                  
+                  {/* Visual Stacking Header Indicator */}
+                  <div className="flex items-center justify-between bg-slate-950/80 p-3 rounded-lg border border-slate-750 text-slate-300 text-xs font-mono select-none">
+                    <span className="font-bold text-teal-400">LESSON NUMBER {les.lessonNumber || index + 1} — LESSON PLAN</span>
+                    <span>Sheet Set {index + 1} of {lessons.length}</span>
+                  </div>
+
+                  {/* PAGE 1 CANVAS OF THIS LESSON PLAN */}
+                  <div className="a4-page bg-white text-black p-10 shadow-2xl relative select-text">
+                    <div className="text-center font-bold text-[10px] text-gray-400 mb-0 leading-none">.</div>
+                    <div className="text-center font-bold text-lg uppercase tracking-wider mb-4 text-black" style={{ fontFamily: 'Arial, sans-serif' }}>
+                      LESSON PLAN (LESSON NUMBER {les.lessonNumber})
+                    </div>
+
+                    <div className="mx-auto" style={{ width: '78%', fontFamily: 'Arial, sans-serif' }}>
+                      <table className="w-full text-[10px] border-collapse" style={{ border: '1px solid #999999' }}>
+                        <tbody>
+                          <tr>
+                            <td colSpan={6} className="text-center font-bold text-xs py-2 bg-green-fill border border-gray-400" style={{ backgroundColor: '#b7d7a8', height: '25px', border: '1px solid #999999' }}>
+                              LESSON PLAN
+                            </td>
+                          </tr>
+
+                          {/* Metadata Grid matching image_b02920.png */}
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8', width: '15%' }}>Week</td>
+                            <td className="text-center py-1 px-2 border border-gray-400" style={{ width: '18%' }}>{les.week || ""}</td>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8', width: '15%' }}>Date</td>
+                            <td className="text-center py-1 px-2 border border-gray-400" style={{ width: '18%' }}>{les.date || ""}</td>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8', width: '15%' }}>Time</td>
+                            <td className="text-center py-1 px-2 border border-gray-400 font-bold" style={{ width: '19%' }}>{les.time || "35 minutes"}</td>
+                          </tr>
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8' }}>Lesson Number</td>
+                            <td className="text-center py-1 px-2 border border-gray-400">{les.lessonNumber || ""}</td>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8' }}>Class</td>
+                            <td className="text-center py-1 px-2 border border-gray-400">{les.class || ""}</td>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8' }}>Subject</td>
+                            <td className="text-center py-1 px-2 border border-gray-400 font-bold">{les.subject || ""}</td>
+                          </tr>
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8' }}>Topic / Strand</td>
+                            <td colSpan={3} className="py-1 px-2 border border-gray-400 text-left">{les.strand || ""}</td>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8' }}>Theme</td>
+                            <td className="py-1 px-2 border border-gray-400 text-left">{les.theme || ""}</td>
+                          </tr>
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8' }}>Subtopic/Sub strand</td>
+                            <td colSpan={5} className="py-1 px-2 border border-gray-400 text-left">{les.subStrand || ""}</td>
+                          </tr>
+
+                          {/* Indicators Header */}
+                          <tr>
+                            <td colSpan={6} className="font-bold text-center py-1 border border-gray-400 bg-green-fill" style={{ backgroundColor: '#b7d7a8' }}>
+                              | Indicators |
+                            </td>
+                          </tr>
+                          <tr>
+                            <td colSpan={6} className="py-2 px-2 border border-gray-400 align-top text-left" style={{ minHeight: '40px' }}>
+                              {les.indicators || "Empty Indicator Details"}
+                            </td>
+                          </tr>
+
+                          {/* Process Skills / Knowledge Skills */}
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left align-middle" style={{ backgroundColor: '#b7d7a8' }}>Process skills</td>
+                            <td colSpan={5} className="py-1 px-2 border border-gray-400 align-top text-left">{les.processSkills || ""}</td>
+                          </tr>
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left align-middle" style={{ backgroundColor: '#b7d7a8' }}>Knowledge skills</td>
+                            <td colSpan={5} className="py-1 px-2 border border-gray-400 align-top text-left">{les.knowledgeSkills || ""}</td>
+                          </tr>
+
+                          {/* KEY COMPETENCIES OUTCOMES ROW matching image_b02920.png */}
+                          <tr>
+                            <td rowSpan={2} className="font-bold text-left border border-gray-400 bg-green-fill align-middle" style={{ backgroundColor: '#b7d7a8', width: '15%', fontSize: '9.5px', paddingLeft: '8px' }}>
+                              Key<br/>Competencies
+                            </td>
+                            <td colSpan={5} className="p-0 border-none">
+                              <table className="w-full text-[8.5px] border-none" style={{ margin: 0, borderCollapse: 'collapse' }}>
+                                <tbody>
+                                  <tr>
+                                    <td colSpan={4} className="font-bold text-left py-1 px-2 border-b border-gray-300 bg-white" style={{ fontSize: '9.5px' }}>
+                                      Key Competencies
+                                    </td>
+                                  </tr>
+                                  <tr className="border-b border-gray-300">
+                                    <td className="py-1 px-2 text-left" style={{ width: '42%', borderRight: '1px solid #999999' }}>1. Practicing Islam</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ width: '8%', borderRight: '1px solid #999999' }}>{les.keyCompetencies?.practicingIslam ? "✓" : ""}</td>
+                                    <td className="py-1 px-2 text-left" style={{ width: '42%', borderRight: '1px solid #999999' }}>5. Living a Healthy Life</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ width: '8%' }}>{les.keyCompetencies?.healthyLife ? "✓" : ""}</td>
+                                  </tr>
+                                  <tr className="border-b border-gray-300">
+                                    <td className="py-1 px-2 text-left" style={{ borderRight: '1px solid #999999' }}>2. Understanding and Managing Self</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ borderRight: '1px solid #999999' }}>{les.keyCompetencies?.managingSelf ? "✓" : ""}</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ borderRight: '1px solid #999999' }}>6. Learning for Sustainable Development</td>
+                                    <td className="py-1 px-2 text-center font-bold">{les.keyCompetencies?.sustainableDevelopment ? "✓" : ""}</td>
+                                  </tr>
+                                  <tr className="border-b border-gray-300">
+                                    <td className="py-1 px-2 text-left" style={{ borderRight: '1px solid #999999' }}>3. Thinking Critically and Creatively</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ width: '8%', borderRight: '1px solid #999999' }}>{les.keyCompetencies?.criticalThinking ? "✓" : ""}</td>
+                                    <td className="py-1 px-2 text-center font-bold text-gray-700">{les.keyCompetencies?.techMedia ? "✓" : ""}</td>
+                                  </tr>
+                                  <tr className="border-b border-gray-300">
+                                    <td className="py-1 px-2 text-left" style={{ borderRight: '1px solid #999999', borderBottom: 'none' }}>4. Making Meaning</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ borderRight: '1px solid #999999', borderBottom: 'none' }}>{les.keyCompetencies?.meaningMaking ? "✓" : ""}</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ borderBottom: 'none' }}>7. Relating to People</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ borderBottom: 'none' }}>{les.keyCompetencies?.relatingPeople ? "✓" : ""}</td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </td>
+                          </tr>
+                          <tr>
+                            <td colSpan={2} className="font-bold text-left py-1 px-2 border-t border-gray-400 bg-green-fill" style={{ backgroundColor: '#b7d7a8', fontSize: '8.5px' }}>
+                              Progression of Key Competencies
+                            </td>
+                            <td colSpan={3} className="py-1 px-2 border-t border-gray-400 bg-white text-left align-top">
+                              {les.progressionOfCompetencies || ""}
+                            </td>
+                          </tr>
+
+                          {/* Outcomes Row containing the bullet points */}
+                          <tr>
+                            <td className="font-bold text-left py-1 px-2 border border-gray-400 bg-green-fill align-middle" style={{ backgroundColor: '#b7d7a8', fontSize: '9.5px' }}>
+                              Outcomes
+                            </td>
+                            <td colSpan={5} className="py-2 px-3 border border-gray-400 bg-white align-top">
+                              <ul className="list-disc pl-5 m-0 space-y-1 text-[9px] text-gray-800 text-left">
+                                {les.bulletOutcomes.map((bullet, bulletIdx) => (
+                                  <li key={bulletIdx}>{bullet}</li>
+                                ))}
+                              </ul>
+                            </td>
+                          </tr>
+
+                          {/* Shared Values Section */}
+                          <tr>
+                            <td rowSpan={2} className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left align-middle" style={{ backgroundColor: '#b7d7a8', fontSize: '9.5px' }}>
+                              Shared Values
+                            </td>
+                            <td colSpan={5} className="p-0 border-none">
+                              <table className="w-full text-[8.5px] border-none" style={{ margin: 0, borderCollapse: 'collapse' }}>
+                                <tbody>
+                                  <tr className="border-b border-gray-300">
+                                    <td className="py-1 px-2 text-left" style={{ width: '42%', borderRight: '1px solid #999999' }}>Values relating to self</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ width: '8%', borderRight: '1px solid #999999' }}>{les.sharedValues?.self ? "✓" : ""}</td>
+                                    <td className="py-1 px-2 text-left" style={{ width: '42%', borderRight: '1px solid #999999' }}>Values relating to local and global community</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ width: '8%' }}>{les.sharedValues?.community ? "✓" : ""}</td>
+                                  </tr>
+                                  <tr>
+                                    <td className="py-1 px-2 text-left" style={{ borderRight: '1px solid #999999' }}>Values relating to family and others</td>
+                                    <td className="py-1 px-2 text-center font-bold" style={{ borderRight: '1px solid #999999' }}>{les.sharedValues?.family ? "✓" : ""}</td>
+                                    <td className="py-1 px-2 text-left">Values relating to the environment</td>
+                                    <td className="py-1 px-2 text-center font-bold">{les.sharedValues?.environment ? "✓" : ""}</td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </td>
+                          </tr>
+                          <tr>
+                            <td colSpan={2} className="font-bold text-left py-1 px-2 border-t border-gray-400 bg-green-fill" style={{ backgroundColor: '#b7d7a8', fontSize: '9px' }}>
+                              Activities:
+                            </td>
+                            <td colSpan={3} className="py-1 px-2 border-t border-gray-400 bg-white text-left align-top">
+                              {les.activitiesSummary || ""}
+                            </td>
+                          </tr>
+
+                          {/* Lower Writable sections */}
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left align-middle" style={{ backgroundColor: '#b7d7a8' }}>Teaching Aids</td>
+                            <td colSpan={5} className="py-1 px-2 border border-gray-400 align-top text-gray-800 text-left" style={{ minHeight: '35px' }}>
+                              {les.teachingAids || ""}
+                            </td>
+                          </tr>
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left align-middle" style={{ backgroundColor: '#b7d7a8' }}>Resources</td>
+                            <td colSpan={5} className="py-1 px-2 border border-gray-400 align-top text-gray-800 text-left cursor-text" style={{ minHeight: '35px' }}>
+                              {les.resources || ""}
+                            </td>
+                          </tr>
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left align-middle" style={{ backgroundColor: '#b7d7a8' }}>Prior Knowledge</td>
+                            <td colSpan={5} className="py-1 px-2 border border-gray-400 align-top text-gray-800 text-left cursor-text" style={{ minHeight: '35px' }}>
+                              {les.priorKnowledge || ""}
+                            </td>
+                          </tr>
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left align-middle" style={{ backgroundColor: '#b7d7a8' }}>Learning Intention</td>
+                            <td colSpan={5} className="py-1 px-2 border border-gray-400 align-top text-gray-800 text-left" style={{ minHeight: '35px' }}>
+                              {les.learningIntention || ""}
+                            </td>
+                          </tr>
+                          <tr>
+                            <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left align-middle" style={{ backgroundColor: '#b7d7a8' }}>Success Criteria</td>
+                            <td colSpan={5} className="py-1 px-2 border border-gray-400 align-top text-gray-800 text-left" style={{ minHeight: '35px' }}>
+                              {les.successCriteria || ""}
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="absolute bottom-4 left-0 right-0 text-center text-[9px] text-gray-400 select-none">
+                      Lesson Number {les.lessonNumber} — Page 1 of 2
+                    </div>
+                  </div>
+
+                  {/* PAGE 2 CANVAS OF THIS LESSON PLAN */}
+                  <div className="a4-page bg-white text-black p-10 shadow-2xl relative select-text">
+                    <div className="text-center font-bold text-lg uppercase tracking-wider mb-4 text-black" style={{ fontFamily: 'Arial, sans-serif' }}>
+                      PAGE 2 — ACTIVITY TABLE (LESSON NUMBER {les.lessonNumber})
+                    </div>
+
+                    <div className="mx-auto" style={{ width: '78%', fontFamily: 'Arial, sans-serif' }}>
+                      <table className="w-full text-[10px] border-collapse" style={{ border: '1px solid #999999' }}>
+                        <tbody>
+                          <tr>
+                            <td colSpan={4} className="font-bold text-center py-2 bg-green-fill border border-gray-400" style={{ backgroundColor: '#b7d7a8', fontSize: '11px' }}>
+                              Activity Details
+                            </td>
+                          </tr>
+
+                          <tr className="bg-green-fill text-center font-bold" style={{ backgroundColor: '#b7d7a8' }}>
+                            <td className="py-1 px-2 border border-gray-400 text-left" style={{ width: '25%' }}>Success Criteria</td>
+                            <td className="py-1 px-2 border border-gray-400 text-left" style={{ width: '45%' }}>Learning Activity</td>
+                            <td className="py-1 px-2 border border-gray-400" style={{ width: '10%' }}>Time</td>
+                            <td className="py-1 px-2 border border-gray-400 text-left" style={{ width: '20%' }}>Assessment methods</td>
+                          </tr>
+
+                          {(les.activityTable || []).map((row, actIdx) => (
+                            <tr key={actIdx}>
+                              <td className="py-2 px-2 border border-gray-400 align-top text-left">
+                                <span className="font-bold block text-[9.5px]">{row.stepName}</span>
+                                <span className="text-gray-600 text-[8px] block mt-1 leading-normal">{row.successCriteria || ""}</span>
+                              </td>
+                              <td className="py-2 px-2 border border-gray-400 align-top text-left leading-normal whitespace-pre-wrap">
+                                {row.learningActivity || ""}
+                              </td>
+                              <td className="py-2 px-2 border border-gray-400 text-center align-middle font-semibold">
+                                {row.time || "—"}
+                              </td>
+                              <td className="py-2 px-2 border border-gray-400 align-top text-left text-gray-700">
+                                {row.assessment || ""}
+                              </td>
+                            </tr>
+                          ))}
+
+                          <tr>
+                            <td colSpan={4} className="font-bold text-center py-1 bg-green-fill border border-gray-400" style={{ backgroundColor: '#b7d7a8' }}>
+                              Reflection
+                            </td>
+                          </tr>
+                          <tr>
+                            <td colSpan={4} className="py-2 px-3 border border-gray-400 align-top text-left text-gray-800" style={{ minHeight: '80px' }}>
+                              {les.reflection || "No reflection notes entered."}
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+
+                      {/* ALIGNED SIGN-OFFS GRID MATCHING image_af3869.png */}
+                      <table className="w-full text-[9px] border-collapse mt-6" style={{ border: '1px solid #999999' }}>
+                        <tbody>
+                          <tr>
+                            <td colSpan={2} className="font-bold text-center py-1 bg-green-fill border border-gray-400" style={{ backgroundColor: '#b7d7a8', width: '50%' }}>Prepared by:</td>
+                            <td colSpan={2} className="font-bold text-center py-1 bg-green-fill border border-gray-400" style={{ backgroundColor: '#b7d7a8', width: '50%' }}>Checked by:</td>
+                          </tr>
+                          <tr>
+                            <td className="bg-green-fill font-semibold text-gray-700 text-left border border-gray-400" style={{ width: '15%', backgroundColor: '#b7d7a8', padding: '4px 6px' }}>Name</td>
+                            <td className="text-left border border-gray-400 bg-white" style={{ width: '35%', padding: '4px 6px' }}>{les.preparedBy?.name}</td>
+                            <td className="bg-green-fill font-semibold text-gray-700 text-left border border-gray-400" style={{ width: '15%', backgroundColor: '#b7d7a8', padding: '4px 6px' }}>Name</td>
+                            <td className="text-left border border-gray-400 bg-white" style={{ width: '35%', padding: '4px 6px' }}>{les.checkedBy?.name}</td>
+                          </tr>
+                          <tr>
+                            <td className="bg-green-fill font-semibold text-gray-700 text-left border border-gray-400" style={{ width: '15%', backgroundColor: '#b7d7a8', padding: '4px 6px' }}>Signature</td>
+                            <td className="text-left font-mono border border-gray-400 bg-white" style={{ width: '35%', padding: '4px 6px' }}>{les.preparedBy?.signature}</td>
+                            <td className="bg-green-fill font-semibold text-gray-700 text-left border border-gray-400" style={{ width: '15%', backgroundColor: '#b7d7a8', padding: '4px 6px' }}>Signature</td>
+                            <td className="text-left font-mono border border-gray-400 bg-white" style={{ width: '35%', padding: '4px 6px' }}>{les.checkedBy?.signature}</td>
+                          </tr>
+                          <tr>
+                            <td className="bg-green-fill font-semibold text-gray-700 text-left border border-gray-400" style={{ width: '15%', backgroundColor: '#b7d7a8', padding: '4px 6px' }}>Position</td>
+                            <td className="text-left border border-gray-400 bg-white" style={{ width: '35%', padding: '4px 6px' }}>{les.preparedBy?.position}</td>
+                            <td className="bg-green-fill font-semibold text-gray-700 text-left border border-gray-400" style={{ width: '15%', backgroundColor: '#b7d7a8', padding: '4px 6px' }}>Position</td>
+                            <td className="text-left border border-gray-400 bg-white" style={{ width: '35%', padding: '4px 6px' }}>{les.checkedBy?.position}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="absolute bottom-4 left-0 right-0 text-center text-[9px] text-gray-400 select-none">
+                      Lesson Number {les.lessonNumber} — Page 2 of 2
+                    </div>
+                  </div>
+
+                  {/* PAGE 3 CANVAS: OPTIONAL CLASS WORKSHEET (Styled beautifully with standard thin borders & green fill) */}
+                  {les.worksheet && (
+                    <div className="a4-page bg-white text-black p-10 shadow-2xl relative select-text">
+                      <div className="text-center font-bold text-lg uppercase tracking-wider mb-2 text-black" style={{ fontFamily: 'Arial, sans-serif' }}>
+                        CLASS WORKSHEET — LESSON {les.lessonNumber}
+                      </div>
+
+                      <div className="mx-auto" style={{ width: '78%', fontFamily: 'Arial, sans-serif' }}>
+                        <table className="w-full text-[10px] border-collapse" style={{ border: '1px solid #999999' }}>
+                          <tbody>
+                            <tr>
+                              <td colSpan={3} className="text-center font-bold text-xs py-2 bg-green-fill border border-gray-400" style={{ backgroundColor: '#b7d7a8', height: '25px' }}>
+                                {les.worksheet.title} (\${les.worksheet.type || 'Review'})
+                              </td>
+                            </tr>
+                            <tr>
+                              <td className="font-bold py-1 px-2 border border-gray-400 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8', width: '20%' }}>Student level</td>
+                              <td className="text-left font-bold py-1 px-2 border border-gray-400" style={{ width: '45%' }}>{les.worksheet.level}</td>
+                              <td style={{ padding: 0, width: '35%' }}>
+                                <table className="w-full text-[10px] border-none" style={{ margin: 0, borderCollapse: 'collapse' }}>
+                                  <tbody>
+                                    <tr>
+                                      <td className="font-bold py-1 px-2 bg-green-fill text-left" style={{ backgroundColor: '#b7d7a8', width: '40%', borderRight: '1px solid #999999', borderBottom: 'none' }}>Time</td>
+                                      <td className="text-center py-1 px-2 font-bold" style={{ border: 'none' }}>{les.worksheet.time}</td>
+                                    </tr>
+                                  </tbody>
+                                </table>
+                              </td>
+                            </tr>
+                            <tr>
+                              <td colSpan={3} className="py-2 px-3 border border-gray-400 bg-gray-50 text-left align-top leading-normal">
+                                <strong>Instructions:</strong> {les.worksheet.instructions}
+                              </td>
+                            </tr>
+                            {les.worksheet.questions.map((q, qIdx) => (
+                              <tr key={qIdx}>
+                                <td className="font-bold text-center border border-gray-400 bg-green-fill align-middle" style={{ backgroundColor: '#b7d7a8', width: '10%', fontSize: '11px' }}>
+                                  Q {q.qNo}
+                                </td>
+                                <td colSpan={2} className="py-3 px-3 border border-gray-400 align-top text-left bg-white" style={{ minHeight: '130px' }}>
+                                  <div className="font-bold text-[10px] mb-2 leading-relaxed text-slate-900 whitespace-pre-line">
+                                    {q.questionText} <span className="text-indigo-700 font-mono text-[9px] ml-1">({q.points})</span>
+                                  </div>
+                                  {/* Generous dotted lines writing space */}
+                                  <div className="mt-8 space-y-2 select-none opacity-40">
+                                    <div className="border-b border-dotted border-gray-400 h-1.5 w-full"></div>
+                                    <div className="border-b border-dotted border-gray-400 h-1.5 w-full"></div>
+                                    <div className="border-b border-dotted border-gray-400 h-1.5 w-full"></div>
+                                  </div>
+                                  <div className="text-[7.5px] text-gray-400 mt-2 text-right italic select-none">
+                                    [{q.answerSpaceInstructions || 'Provide your detailed analysis above'}]
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+
+                        {/* Expanding Marking Guide */}
+                        <details className="mt-6 border border-gray-300 rounded-lg p-2.5 bg-gray-50 text-left select-none print:hidden">
+                          <summary className="font-bold text-[10px] text-teal-700 cursor-pointer hover:text-teal-600 flex items-center gap-1">
+                            <Eye className="w-3.5 h-3.5" /> Toggle Marking Guide (Expected Answers)
+                          </summary>
+                          <table className="w-full text-[9px] border-collapse mt-3" style={{ border: '1px solid #999999' }}>
+                            <tbody>
+                              <tr>
+                                <td colSpan={2} className="bg-green-fill text-center font-bold py-1 border border-gray-400" style={{ backgroundColor: '#b7d7a8' }}>Marking Guide & Solution Outlines</td>
+                              </tr>
+                              {les.worksheet.questions.map((q, qKey) => (
+                                <tr key={qKey}>
+                                  <td className="bg-green-fill font-bold p-1 text-center border border-gray-400" style={{ backgroundColor: '#b7d7a8', width: '15%' }}>Q {q.qNo} expected</td>
+                                  <td className="p-1 border border-gray-400 bg-white leading-relaxed text-gray-800">{q.expectedAnswer}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </details>
+                      </div>
+
+                      <div className="absolute bottom-4 left-0 right-0 text-center text-[9px] text-gray-400 select-none">
+                        Lesson Number {les.lessonNumber} — Page 3 of 3
+                      </div>
+                    </div>
+                  )}
+
+                </div>
+              );
+            })}
+
+          </div>
+        </section>
+      </main>
+
+      {/* Modern High-Fidelity Worksheet Generator Modal Overlay */}
+      {isWorksheetModalOpen && (
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-fadeIn">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            {/* Header */}
+            <div className="flex justify-between items-center pb-2 border-b border-slate-800">
+              <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                <Sparkles className="w-4.5 h-4.5 text-emerald-400 animate-pulse" />
+                AI Worksheet Generation Config
+              </h3>
+              <button 
+                onClick={() => setIsWorksheetModalOpen(false)}
+                className="text-slate-400 hover:text-white transition-colors text-xs font-semibold"
+              >
+                ✕ Close
+              </button>
+            </div>
+
+            {/* Config Fields */}
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1 font-medium">Select Target Student Grade</label>
+                <select 
+                  value={wsGrade}
+                  onChange={(e) => setWsGrade(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                >
+                  {[...Array(12)].map((_, i) => (
+                    <option key={i} value={"Grade " + (i + 1)}>Grade {i + 1}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-emerald-400 font-semibold mb-1">Google Drive / Shared Link Context</label>
+                <input 
+                  type="text" 
+                  placeholder="Paste shared syllabus folder or textbook URL..."
+                  value={wsDriveLink || ""}
+                  onChange={(e) => setWsDriveLink(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Worksheet Question Format</label>
+                <select 
+                  value={wsType}
+                  onChange={(e) => setWsType(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                >
+                  <option value="Question and Answer">Question and Answer (Standard Open Analytical)</option>
+                  <option value="MCQ">MCQ (Multiple Choice Questions with options A, B, C, D)</option>
+                  <option value="Quiz">Quiz (Rapid retrieval conceptual checkpoints)</option>
+                  <option value="Fill in the blanks">Fill in the Blanks (Contextual completion sentences)</option>
+                  <option value="Match the columns">Match the Columns (Column A and B Pairings)</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">Amount of Questions</label>
+                  <select 
+                    value={wsNumQuestions}
+                    onChange={(e) => setWsNumQuestions(e.target.value)}
+                    className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                  >
+                    <option value="3">3 Questions</option>
+                    <option value="5">5 Questions</option>
+                    <option value="10">10 Questions</option>
+                    <option value="15">15 Questions (Full Exam)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">Differentiated level</label>
+                  <select 
+                    value={wsStudentLevel}
+                    onChange={(e) => setWsStudentLevel(e.target.value)}
+                    className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                  >
+                    <option value="Normal">Normal (Grade-standard conceptual)</option>
+                    <option value="ICP">ICP (Highly structured with scaffolded guides)</option>
+                    <option value="lower level">lower level (Recall based with simplified terms)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Duration Limit</label>
+                <select 
+                  value={wsTimeLimit}
+                  onChange={(e) => setWsTimeLimit(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded px-2.5 py-1.5 text-black focus:outline-none focus:ring-2 focus:ring-teal-500"
+                >
+                  <option value="10 mins">10 minutes</option>
+                  <option value="15 mins">15 minutes</option>
+                  <option value="20 mins">20 minutes</option>
+                  <option value="30 mins">30 minutes</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Error Message */}
+            {errorMsg && (
+              <div className="bg-red-950/40 border border-red-500/30 p-2.5 rounded-lg text-[11px] text-red-200 flex items-start gap-1.5">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
+
+            {/* Footer Buttons */}
+            <div className="flex justify-between items-center pt-2 gap-3 flex-wrap">
+              {/* Export Active Worksheet PDF directly if it exists */}
+              {activeLesson.worksheet ? (
+                <button
+                  type="button"
+                  onClick={handleExportWorksheetPDF}
+                  className="px-3.5 py-2 text-xs font-bold text-emerald-300 hover:text-white bg-emerald-950/40 hover:bg-emerald-900/60 border border-emerald-500/30 rounded-lg flex items-center gap-1.5 transition-colors"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  Export PDF Handout
+                </button>
+              ) : <div />}
+
+              <div className="flex gap-2 ml-auto">
+                <button
+                  type="button"
+                  onClick={() => setIsWorksheetModalOpen(false)}
+                  className="px-4 py-2 text-xs font-semibold text-slate-300 hover:text-white bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await generateClassWorksheet();
+                    setIsWorksheetModalOpen(false);
+                  }}
+                  disabled={worksheetLoading}
+                  className="px-4 py-2 text-xs font-bold text-white bg-gradient-to-r from-emerald-600 to-teal-600 rounded-lg flex items-center gap-1 hover:from-emerald-500 hover:to-teal-500 transition-all disabled:opacity-40"
+                >
+                  {worksheetLoading ? "Scouting..." : "✨ Generate Worksheet"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Styled inline Print Stylesheet */}
+      <style>{`
+        @media print {
+          body {
+            background: white !important;
+            color: black !important;
+          }
+          header, section:first-of-type, .preview-container > div:first-child {
+            display: none !important;
+          }
+          .preview-container {
+            padding: 0 !important;
+            margin: 0 !important;
+            max-height: none !important;
+            overflow: visible !important;
+            display: block !important;
+          }
+          .a4-page {
+            box-shadow: none !important;
+            padding: 1.5cm 2cm !important;
+            margin: 0 auto 30px auto !important;
+            page-break-after: always !important;
+            width: 21cm !important;
+            height: 29.7cm !important;
+            font-size: 10pt !important;
+            border: none !important;
+          }
+          table {
+            width: 100% !important;
+          }
+        }
+
+        .a4-page {
+          width: 21cm;
+          min-height: 29.7cm;
+          aspect-ratio: 1 / 1.414;
+        }
+
+        .bg-green-fill {
+          background-color: #b7d7a8 !important;
+        }
+
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(4px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+
+        .animate-fadeIn {
+          animation: fadeIn 0.15s ease-out forwards;
+        }
+      `}</style>
+    </div>
+  );
+}
